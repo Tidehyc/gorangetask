@@ -46,7 +46,7 @@
 | [x] | 定 Handler 超时语义 | 逐任务超时与 Worker 默认超时的优先级明确 | 2026-10-11 定：`Task.Timeout` 非零覆盖、零值回退 Worker 默认；由 ctx deadline 实现（需求 §12.1-7、技术设计 §6） |
 | [x] | 定义 Worker 配置类型与校验 | 配置字段齐备且有默认值与合法性校验 | 2026-10-11 提交 `921e230`：`Config` 16 字段 + 全部默认值常量；`WithDefaults`/`Validate`（包裹 `ErrInvalidConfig`）；`Task.Timeout` 落地；单测覆盖 19 类非法配置，覆盖率 100% |
 | [x] | 建立本地 MySQL 开发环境 | 一条命令启动 MySQL 8，migration 可应用/回滚 | 2026-10-11 容器化 MySQL 8.0.46（`gotask-mysql`）已跑通；`scripts/dev-mysql.sh up` 启停；宿主机未装 mysql-server，环境不被污染 |
-| [ ] | 建立 CI 基线 | format、vet、unit test、MySQL integration test 可在 CI 执行 | 待实现 |
+| [x] | 建立 CI 基线 | format、vet、unit test 可在 CI 执行（MySQL integration test 待有集成测试后补） | 2026-10-11 提交 `44f468f`：`.github/workflows/ci.yml`，push/PR 到 main 触发 gofmt→vet→build→test -race；首次运行 `38136967246` **success（29s）**；Go 版本由 go.mod 驱动（CI 实跑 1.24） |
 
 ## 2. 持久化与事务入队
 
