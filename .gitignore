@@ -1,0 +1,35 @@
+# 二进制与构建产物
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go 工作区与依赖缓存
+go.work
+go.work.sum
+/vendor/
+
+# 覆盖率与性能分析
+coverage.txt
+coverage.html
+*.prof
+
+# 编辑器与 IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境变量与本地密钥
+.env
+.env.local
+*.local.env
+
+# 本地基准 / 测试输出
+/bench_out/
+/tmp/
