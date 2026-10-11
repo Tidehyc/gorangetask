@@ -67,6 +67,13 @@ type Task struct {
 	RunAt time.Time
 	// MaxAttempts 是最大尝试次数。零值表示使用配置默认值；必须大于 0。
 	MaxAttempts int
+	// Timeout 是本次执行的 Handler 超时。零值表示使用 Worker 配置的默认
+	// Handler 超时；非零值覆盖该默认值。
+	//
+	// 超时通过传给 Handler 的 context.Context 的 deadline 实现，与租约丢失、
+	// shutdown 复用同一套协作式取消机制。超时只请求 Handler 停止，不保证
+	// 撤销已经发生的外部副作用。
+	Timeout time.Duration
 	// IdempotencyKey 是可选的幂等键。同队列内相同的非空键在任务记录保留
 	// 期间最多只能创建一条有效任务。
 	IdempotencyKey string

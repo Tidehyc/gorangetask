@@ -24,6 +24,9 @@ var (
 	// ErrInvalidTask 表示任务定义本身不合法（例如空 task type、非正数 max attempts）。
 	ErrInvalidTask = errors.New("gorangetask: invalid task")
 
+	// ErrInvalidConfig 表示配置不合法。Validate 返回的错误可用 errors.Is 匹配它。
+	ErrInvalidConfig = errors.New("gorangetask: invalid config")
+
 	// ErrLeaseLost 表示当前执行者已失去任务租约，无法写回状态。
 	// 出现该错误时，本次执行的结果不得覆盖任务记录。
 	ErrLeaseLost = errors.New("gorangetask: lease lost")
