@@ -34,8 +34,8 @@
 | [x] | 编写实现前技术设计 | DDL、领取/续租/确认/回收 SQL、API 和测试设计齐备 | 技术设计 v0.1 |
 | [x] | 确认 module 完整路径可用并重新认证 gh | 写定 `github.com/Tidehyc/gorangetask` | 2026-10-11 本机 `gh auth status` 已确认账号 Tidehyc 已登录且 token 有效（scopes 含 `repo`）；模块路径已定 |
 | [x] | 定最低 Go 版本与许可证 | README/go.mod/CI 使用一致版本和许可证 | 2026-10-11 定：最低 Go **1.24**；许可证 **MIT** |
-| [ ] | 创建仓库并初始化 Go module | 本地 `git init`、README、LICENSE、go.mod、.gitignore 可运行 | 待执行（下一步） |
-| [ ] | 创建远程仓库并首次推送 | GitHub 上 `Tidehyc/gorangetask` 存在且 main 已推送 | 待本地初始化后再建远程 |
+| [x] | 创建仓库并初始化 Go module | 本地 `git init`、README、LICENSE、go.mod、.gitignore 可运行 | 2026-10-11 `git init -b main`；首个提交 `3bb5009`（10 files, +1074）；module 最低 Go 1.24 |
+| [x] | 创建远程仓库并首次推送 | GitHub 上 `Tidehyc/gorangetask` 存在且 main 已推送 | 2026-10-11 远程 `Tidehyc/gorangetask`（public，默认分支 main）已建；`main` 推送至 `958d120`，跟踪 origin/main |
 
 ## 1. 项目骨架与开发约定
 
