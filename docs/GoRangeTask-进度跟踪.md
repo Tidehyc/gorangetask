@@ -41,8 +41,9 @@
 
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
-| [ ] | 初始化模块与包结构 | core、MySQL store、migration、example 结构建立 | 待实现 |
-| [ ] | 定义公开错误与 API 类型 | Task、TaskID、TaskInfo、Handler、Client、配置、错误语义有文档 | 待实现 |
+| [x] | 初始化模块与包结构 | core、MySQL store、migration、example 结构建立 | 2026-10-11 根包 `gorangetask` 已建（doc/task/errors/handler/client）；store、migration、example 随实现阶段加入 |
+| [x] | 定义公开错误与 API 类型 | Task、TaskID、TaskInfo、Handler、Client、配置、错误语义有文档 | 2026-10-11 提交 `57be84f`：Task/TaskInfo/TaskID/Status、7 个公开错误、Handler+Registry、Tx/Client 接口；10 个单测通过、`-race` 通过、覆盖率 100% |
+| [ ] | 定义 Worker 配置类型与校验 | 配置字段齐备且有默认值与合法性校验 | 待实现（Worker 阶段） |
 | [x] | 建立本地 MySQL 开发环境 | 一条命令启动 MySQL 8，migration 可应用/回滚 | 2026-10-11 容器化 MySQL 8.0.46（`gotask-mysql`）已跑通；`scripts/dev-mysql.sh up` 启停；宿主机未装 mysql-server，环境不被污染 |
 | [ ] | 建立 CI 基线 | format、vet、unit test、MySQL integration test 可在 CI 执行 | 待实现 |
 
