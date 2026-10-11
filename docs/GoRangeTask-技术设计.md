@@ -219,8 +219,9 @@ type Task struct {
     Queue          string
     Type           string
     Payload        json.RawMessage
-    RunAt          time.Time // 零值表示立即运行；非零值由应用传入 UTC instant
-    MaxAttempts    int       // 零值使用默认值
+    RunAt          time.Time     // 零值表示立即运行；非零值由应用传入 UTC instant
+    MaxAttempts    int           // 零值使用默认值
+    Timeout        time.Duration // 零值使用 Worker 默认 Handler 超时
     IdempotencyKey string
 }
 
@@ -238,6 +239,8 @@ type Client interface {
 }
 ```
 
+`Task.Timeout` 为逐任务超时（对应需求文档 §7 草案与 §4.2「Handler 执行超时可配置」）：零值表示使用 Worker 级默认 Handler 超时；非零值覆盖本次执行的 Handler 超时。该超时通过传给 Handler 的 `context.Context` 的 deadline 实现，与租约、shutdown 的取消是同一套协作式取消机制。
+
 API 约定：
 
 - `EnqueueTx` 的 `Tx` 只要求执行 INSERT 所需的方法，不暴露 Commit/Rollback，避免库误操作调用方事务。
@@ -248,23 +251,32 @@ API 约定：
 
 Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至 2 秒并加抖动）、batch size 1、lease duration 30 秒、heartbeat 10 秒、shutdown timeout 30 秒。所有配置可覆盖；这些默认值是起步值，压测后再调整。
 
-## 7. 项目包结构建议
+## 7. 项目包结构
 
 ```text
 .
-├── client.go             # API 和构造器
-├── task.go               # Task、TaskInfo、错误类型
-├── handler.go            # 注册表和 Handler 类型
+├── doc.go                # 包级文档
+├── client.go             # Client/Tx 接口与构造器
+├── task.go               # Task、TaskInfo、TaskID、Status
+├── errors.go             # 公开可判断错误
+├── handler.go            # Handler 类型与 Registry 注册表
+├── config.go             # Worker 与 Client 配置、默认值与校验
 ├── worker.go             # Worker 生命周期、并发和 shutdown
 ├── store/                # MySQL store、claim/lease/retry/reaper SQL
-├── migrations/mysql/     # 版本化 DDL
+│   └── mysql/            # 方言实现与迁移
+├── migrations/mysql/     # 版本化 DDL（embed 到 store/mysql）
 ├── adapter/gorm/         # 可选官方 GORM adapter
 ├── example/basic/        # 业务事务 + EnqueueTx + Handler 示例
 ├── integration/          # 真 MySQL 测试
 └── docs/                 # API、语义、运维与基准说明
 ```
 
-此为组织建议，不要求所有功能首轮就拆成大量包；先维持小而清晰的公开 API。
+结构决策（2026-10-11 确认）：
+
+- **根包 `gorangetask` 保留公开契约**：`Task`/`TaskInfo`/`Status`/`Handler`/`Registry`/`Client`/`Tx`/配置/错误。使用者的导入面只有根包，语义一目了然。
+- **`store/` 承载 SQL 与方言**：领取、续租、成功/失败确认、回收、清理等所有语句实现放在 `store/`（MySQL 方言在 `store/mysql`）。根包通过接口依赖 store，不直接写 SQL。
+- **可选依赖隔离在子包**：GORM adapter 放 `adapter/gorm`，只有使用 GORM 的应用才引入；`migrations` 通过 `embed` 打包，避免运行时依赖外部文件路径。
+- **首版不必一次性建满**：根包在 API 类型阶段已经成形；`config.go`/`worker.go`/`store/` 随对应实现阶段加入，`example`/`integration`/`adapter` 在验证与适配阶段加入。目录只在有真实内容时创建，不提交空占位目录。
 
 ## 8. 验证计划
 

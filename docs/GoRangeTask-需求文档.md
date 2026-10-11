@@ -204,7 +204,9 @@ type Client interface {
 
 `EnqueueTx` 接收一个能在现有事务内执行 SQL 的事务执行器。标准 `*sql.Tx` 可直接适配；官方可选 GORM adapter 提供面向 `*gorm.DB` 的入口，要求传入正在运行的事务对象，并通过该对象执行任务插入，不能另开事务或从连接池取新连接。GORM adapter 放在独立子包，只有使用 GORM 的应用才引入该依赖；核心包不直接依赖 GORM。示例需验证“业务写入 + 任务入队”一同提交、一起回滚。
 
-Worker 配置至少包括：数据库连接、监听队列、并发数、poll interval、lease duration、heartbeat interval、shutdown timeout、重试策略、最大 payload 和日志/指标钩子。默认数值在基准测试后确定，并允许覆盖。
+`Task.Timeout` 为逐任务超时（对应 §4.2「Handler 执行超时可配置」）：零值表示使用 Worker 级默认 Handler 超时，非零值覆盖本次执行。该超时通过传给 Handler 的 `context.Context` deadline 实现，与租约丢失、shutdown 复用同一套协作式取消机制；超时不保证撤销已发生的外部副作用。
+
+Worker 配置至少包括：数据库连接、监听队列、并发数、poll interval、lease duration、heartbeat interval、shutdown timeout、默认 Handler 超时、重试策略、最大 payload 和日志/指标钩子。默认数值在基准测试后确定，并允许覆盖。
 
 ## 8. 可观测性要求
 
@@ -293,6 +295,8 @@ Worker 配置至少包括：数据库连接、监听队列、并发数、poll in
 4. **本地数据库：** 本地开发与集成测试统一使用容器化 MySQL 8.0.46（`mysql:8.0` 镜像）；宿主机不安装、不运行 mysql-server，避免污染本机环境。容器由仓库内 `scripts/dev-mysql.sh {up|down|reset|status|shell}` 管理。
 5. **容器环境：** 宿主机 Docker 已可用；Testcontainers-Go 可作为集成测试的可选方案，与本地 `scripts/dev-mysql.sh` 二选一。
 6. **提交约定：** 以需求为粒度提交；每次开工前先与项目所有者确认。
+7. **Handler 超时：** 采用逐任务可覆盖的超时，即 `Task.Timeout` 非零时覆盖 Worker 默认 Handler 超时，零值回退到 Worker 配置；由 `context.Context` deadline 实现。
+8. **包结构：** 根包 `gorangetask` 只承载公开契约（Task/TaskInfo/Status/Handler/Registry/Client/Tx/配置/错误）；所有 SQL 与 MySQL 方言实现放 `store/`（`store/mysql`）；GORM adapter 隔离在 `adapter/gorm`；migration 用 `embed` 打包。目录随对应阶段创建，不提交空占位目录。详见技术设计 §7。
 
 ## 13. 参考实现与借鉴范围
 
