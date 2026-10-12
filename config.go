@@ -257,3 +257,66 @@ func (c Config) Validate() error {
 	}
 	return fmt.Errorf("%w: %w", ErrInvalidConfig, errors.Join(errs...))
 }
+
+// ClientConfig 是入队侧（Client）的配置。零值 ClientConfig 是合法的：缺省字段
+// 会被填充为默认值，因此调用方只需设置想覆盖的字段。
+//
+// 它与 Config（Worker 运行配置）刻意分开：Worker 配置描述"怎么执行任务"，
+// ClientConfig 描述"任务怎么写进库"。两者都不需要对方存在——只想入队、
+// 不跑 Worker 的进程不必构造 Worker 配置。
+//
+// 使用方式：
+//
+//	cfg := gorangetask.ClientConfig{MaxPayloadSize: 32 * 1024}
+//	cfg = cfg.WithDefaults()
+//	if err := cfg.Validate(); err != nil { ... }
+type ClientConfig struct {
+	// DefaultQueue 是任务未指定 Queue 时使用的队列名。不能为空。
+	//
+	// 该字段的实际长度上限由各 store 方言决定（MySQL 为 64 字符），
+	// 由方言实现在构造时校验，根包不绑定具体数据库的列宽。
+	DefaultQueue string
+
+	// DefaultMaxAttempts 是任务未指定 MaxAttempts 时使用的最大尝试次数。
+	// 必须大于 0。
+	DefaultMaxAttempts int
+
+	// MaxPayloadSize 是单个任务 payload 的字节上限。必须大于 0。
+	MaxPayloadSize int
+}
+
+// WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。
+// 它不修改接收者，也不做合法性校验；校验请调用 Validate。
+func (c ClientConfig) WithDefaults() ClientConfig {
+	if c.DefaultQueue == "" {
+		c.DefaultQueue = DefaultQueue
+	}
+	if c.DefaultMaxAttempts == 0 {
+		c.DefaultMaxAttempts = DefaultMaxAttempts
+	}
+	if c.MaxPayloadSize == 0 {
+		c.MaxPayloadSize = DefaultMaxPayloadSize
+	}
+	return c
+}
+
+// Validate 校验入队配置的合法性。返回的错误可用 errors.Is 匹配 ErrInvalidConfig；
+// 存在多个问题时返回一个合并错误，逐条说明原因。
+func (c ClientConfig) Validate() error {
+	var errs []error
+
+	if c.DefaultQueue == "" {
+		errs = append(errs, errors.New("client default queue is required"))
+	}
+	if c.DefaultMaxAttempts <= 0 {
+		errs = append(errs, fmt.Errorf("client default max attempts must be > 0, got %d", c.DefaultMaxAttempts))
+	}
+	if c.MaxPayloadSize <= 0 {
+		errs = append(errs, fmt.Errorf("client max payload size must be > 0, got %d", c.MaxPayloadSize))
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrInvalidConfig, errors.Join(errs...))
+}

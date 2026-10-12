@@ -191,3 +191,73 @@ func TestConfigValidateAcceptsBoundaryBatchSize(t *testing.T) {
 		}
 	}
 }
+
+func TestClientConfigZeroValueIsValidAfterDefaults(t *testing.T) {
+	cfg := ClientConfig{}.WithDefaults()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero-value client config after WithDefaults should be valid, got: %v", err)
+	}
+
+	if cfg.DefaultQueue != DefaultQueue {
+		t.Errorf("DefaultQueue = %q, want %q", cfg.DefaultQueue, DefaultQueue)
+	}
+	if cfg.DefaultMaxAttempts != DefaultMaxAttempts {
+		t.Errorf("DefaultMaxAttempts = %d, want %d", cfg.DefaultMaxAttempts, DefaultMaxAttempts)
+	}
+	if cfg.MaxPayloadSize != DefaultMaxPayloadSize {
+		t.Errorf("MaxPayloadSize = %d, want %d", cfg.MaxPayloadSize, DefaultMaxPayloadSize)
+	}
+}
+
+func TestClientConfigDefaultsDoNotOverrideExplicitValues(t *testing.T) {
+	cfg := ClientConfig{
+		DefaultQueue:       "orders",
+		DefaultMaxAttempts: 3,
+		MaxPayloadSize:     1024,
+	}.WithDefaults()
+
+	if cfg.DefaultQueue != "orders" {
+		t.Errorf("DefaultQueue = %q, want %q", cfg.DefaultQueue, "orders")
+	}
+	if cfg.DefaultMaxAttempts != 3 {
+		t.Errorf("DefaultMaxAttempts = %d, want 3", cfg.DefaultMaxAttempts)
+	}
+	if cfg.MaxPayloadSize != 1024 {
+		t.Errorf("MaxPayloadSize = %d, want 1024", cfg.MaxPayloadSize)
+	}
+}
+
+func TestClientConfigWithDefaultsDoesNotMutateReceiver(t *testing.T) {
+	original := ClientConfig{}
+	_ = original.WithDefaults()
+
+	if original.DefaultQueue != "" || original.DefaultMaxAttempts != 0 || original.MaxPayloadSize != 0 {
+		t.Errorf("WithDefaults mutated the receiver: %+v", original)
+	}
+}
+
+func TestClientConfigValidateRejectsInvalid(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  ClientConfig
+	}{
+		{"empty default queue", ClientConfig{DefaultMaxAttempts: 1, MaxPayloadSize: 1}},
+		{"zero max attempts", ClientConfig{DefaultQueue: "q", MaxPayloadSize: 1}},
+		{"negative max attempts", ClientConfig{DefaultQueue: "q", DefaultMaxAttempts: -1, MaxPayloadSize: 1}},
+		{"zero payload size", ClientConfig{DefaultQueue: "q", DefaultMaxAttempts: 1}},
+		{"negative payload size", ClientConfig{DefaultQueue: "q", DefaultMaxAttempts: 1, MaxPayloadSize: -1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() = nil, want error")
+			}
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("Validate() error = %v, want to wrap ErrInvalidConfig", err)
+			}
+		})
+	}
+}
