@@ -1,69 +1,84 @@
 # GoRangeTask
 
-GoRangeTask 是一个可嵌入 Go 服务的 **MySQL 事务型持久化任务队列**。
+GoRangeTask 是一个可嵌入 Go 服务的 **MySQL 持久化任务队列**，面向由本服务 Worker 执行的后台任务。
 
-它把数据库中的任务表本身当作持久化投递通道：调用方可以在**自己的业务事务**中写入业务数据与任务记录，事务提交后由 Worker 从表中领取任务并直接执行本进程注册的 Go Handler。**不依赖 RabbitMQ** 等外部 Broker。
+> **项目状态：早期开发中。** 仓库已有任务与配置类型、Handler 注册表、错误定义、MySQL migration 和对应测试；持久化 Client、Worker 领取与执行、租约恢复等核心闭环尚未完成。当前文档描述的是目标设计与验收计划，不代表所有功能已经可用。进度见[项目进度跟踪](docs/GoRangeTask-进度跟踪.md)。
 
-> 状态：**设计阶段，尚未实现代码**。仓库当前只包含需求、技术设计与进度文档。下面描述的是目标行为与验收计划，不是已实现结果。
+## 项目定位
 
-## 解决什么问题
+业务服务可以在**自己的数据库事务**中写入业务数据和 GoRangeTask 任务行。事务提交后，GoRangeTask Worker 从 MySQL 领取任务并调用本地注册的 Go Handler。
 
-业务数据变更往往需要触发延迟处理、文件/媒体加工、索引构建或补偿工作。若先在数据库写入业务数据、再独立向队列投递任务，两步之间可能因进程退出或网络故障而不一致。
+同一事务插入业务数据和任务行，直接 SQL 就可以实现。GoRangeTask 不会比 MySQL 事务提供更强的原子性保证。它的目标是把任务行写入之后的执行生命周期封装为可复用库：并发领取、租约续期、Worker 故障恢复、失败重试、旧租约写回保护和死信管理。
 
-GoRangeTask 要保证两件事：
+```mermaid
+flowchart LR
+    A[业务 Producer] -->|同一事务：业务数据 + 任务行| DB[(MySQL)]
+    DB -->|领取任务 / 租约| W[GoRangeTask Worker]
+    W --> H[本地 Go Handler]
+    H -->|成功确认或失败重试| DB
+```
 
-1. **原子创建**：业务事务提交时任务一定存在；事务回滚时任务一定不存在。
-2. **可靠执行**：多 Worker 并发领取；Worker 崩溃后可恢复；失败按策略重试；租约失效的旧 Worker 不能覆盖新状态。
+GoRangeTask 适用于生产者与 Handler 共用数据库、任务由本服务执行且需要可靠恢复的场景。简单任务也可以直接用 SQL 自行实现；使用 GoRangeTask 的理由是复用并验证完整的并发和故障处理机制。
 
-执行语义是**至少一次**：Handler 可能重复运行，业务副作用需要幂等。GoRangeTask 只保证任务记录最终被持久化并至少一次交给已注册的 Handler 尝试执行，**不保证外部副作用恰好一次**。
+## 执行语义与边界
 
-## 与 Outbox + RabbitMQ 的边界
+GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策略允许的情况下至少交给 Handler 尝试执行一次。Handler 可能重复运行，也可能因永久错误或达到最大尝试次数进入死信。
 
-GoRangeTask 处理的是**本服务要执行的 Job**（生产者与 Handler 同服务、共用数据库），而不是要发布给多个订阅者的**领域事件**。RabbitMQ 仍适用于跨服务/跨语言分发、广播、Broker 缓冲与独立订阅等场景；GoRangeTask 不做 RabbitMQ 的转发器，也不替代它。详见 [docs/GoRangeTask-STAR.md](docs/GoRangeTask-STAR.md)。
+- **不保证 Handler 必定成功。** 长期故障、永久错误或重试次数耗尽时，需要告警或人工处理。
+- **不保证 exactly-once（恰好一次）外部副作用。** Handler 应实现幂等；fencing token 保护的是 GoRangeTask 任务状态，不会撤销已经发生的外部操作。
+- **不替代 RabbitMQ。** 需要跨服务/跨语言分发、广播、路由、Broker 缓冲或多个独立订阅者时，继续使用 Outbox + RabbitMQ 等事件架构。GoRangeTask 不充当 Outbox 转发器。
+- **不追求默认高于 Broker 的吞吐。** MySQL 查询、锁等待、连接池和轮询成本需要在目标负载下实测。
 
-## 目标能力（MVP）
+## MVP 目标能力
 
-- 事务内入队：`EnqueueTx` 把任务写入调用方正在使用的事务，库不接管事务生命周期。
-- 立即执行与延迟执行。
-- 多 Worker 基于 MySQL InnoDB 行锁 + `SKIP LOCKED` 并发领取。
-- 数据库时间基准的租约、续租与过期回收。
-- 递增 `lease_epoch`（fencing token）拒绝旧执行者写回。
-- 失败重试（full-jitter 指数退避）、永久失败、死信。
-- 可选幂等键、任务状态查询、取消未领取任务。
-- 优雅停机、结构化日志与基础指标。
+以下是目标功能，尚未全部实现：
+
+- `EnqueueTx`：在调用方现有数据库事务中写入任务，不接管事务的提交或回滚。
+- 立即执行和延迟执行。
+- MySQL InnoDB 多 Worker 并发领取，使用短事务和 `FOR UPDATE SKIP LOCKED`。
+- 数据库时间基准的租约、续期、过期恢复。
+- 递增 `lease_epoch`（fencing token），拒绝旧租约持有者写回任务状态。
+- 可配置重试次数、full-jitter 指数退避、永久失败和死信。
+- 可选幂等键、任务状态查询、取消尚未领取的任务。
+- 优雅停机、结构化日志、基础指标和终态任务清理。
+- 可独立运行的示例，演示事务入队、Worker 执行和故障恢复。
 
 ## 技术基线
 
-| 项 | 选定值 |
+| 项目 | 选择 |
 |---|---|
-| 语言 | Go（最低 **1.24**） |
-| 数据库 | MySQL **8.0+** / InnoDB（MVP 仅验证 MySQL） |
-| SQL 层 | 核心包基于 `database/sql`，**不依赖 GORM**；另提供可选官方 GORM adapter 子包 |
-| 许可 | MIT |
-| 模块路径 | `github.com/Tidehyc/gorangetask` |
+| 公开项目名 | GoRangeTask |
+| 仓库名 | `gorangetask` |
+| Go module | `github.com/Tidehyc/gorangetask` |
+| Go 版本 | 1.24+ |
+| 数据库 | MySQL 8.0+ / InnoDB；MVP 只验证 MySQL |
+| SQL 层 | 核心包使用 `database/sql`，不依赖 GORM；GORM adapter 为可选组件 |
+| 许可证 | MIT |
 
-## 本地开发环境
+数据库任务表承担本地任务持久化与 Worker 领取，不经过 RabbitMQ。未来支持其他数据库时，需要单独实现并验证该数据库的 migration、领取 SQL、租约 SQL 和并发语义。
 
-仓库自带 `scripts/dev-mysql.sh`，用容器化 MySQL 8.0 做本地开发与集成测试，不污染宿主机：
+## 本地 MySQL 环境
+
+仓库提供 `scripts/dev-mysql.sh`，用容器化 MySQL 8.0 作为本地开发库：
 
 ```bash
-./scripts/dev-mysql.sh up      # 启动（首次会按固定参数创建容器）
+./scripts/dev-mysql.sh up      # 启动 MySQL 容器
 ./scripts/dev-mysql.sh status  # 查看状态
-./scripts/dev-mysql.sh shell   # 进入 mysql 客户端
-./scripts/dev-mysql.sh down    # 停止（保留数据卷）
-./scripts/dev-mysql.sh reset   # 删除容器与数据卷，彻底重来
+./scripts/dev-mysql.sh shell   # 打开 mysql 客户端
+./scripts/dev-mysql.sh down    # 停止容器，保留数据卷
+./scripts/dev-mysql.sh reset   # 删除容器和数据卷
 ```
 
-默认连接信息：`127.0.0.1:3306`，库 `gotask`，用户 `root`，密码 `rootpw`，UTC 时区，`READ-COMMITTED` 隔离级别。
+默认连接信息：`127.0.0.1:3306`，数据库 `gotask`，用户 `root`，密码 `rootpw`，UTC 时区，`READ-COMMITTED` 隔离级别。该环境用于本地开发；不要将示例密码用于共享或生产环境。
 
 ## 文档
 
-- [需求文档](docs/GoRangeTask-需求文档.md)：目标、非目标、P0/P1 功能需求、状态机、数据存储、API 与配置草案、可观测性与验收标准。
-- [技术设计](docs/GoRangeTask-技术设计.md)：数据模型 DDL、领取/续租/确认/回收/清理 SQL、Go API 草案、包结构与验证计划。
-- [迁移机制](docs/GoRangeTask-迁移机制.md)：数据库迁移的原理、MySQL DDL 不可回滚与脏状态、advisory lock、多语句处理及实测验证记录。
-- [进度跟踪](docs/GoRangeTask-进度跟踪.md)：对照需求的完成状态与证据。
-- [STAR 说明](docs/GoRangeTask-STAR.md)：项目背景、与 Outbox/RabbitMQ 的边界、简历证据框架。
+- [需求文档](docs/GoRangeTask-需求文档.md)：项目目标、MVP 范围、状态机、API 草案、可观测性和验收标准。
+- [技术设计](docs/GoRangeTask-技术设计.md)：任务表 DDL、领取/续租/确认/回收 SQL、API 与验证计划。
+- [迁移机制](docs/GoRangeTask-迁移机制.md)：MySQL DDL、dirty 状态、advisory lock、多语句处理及实测验证。
+- [进度跟踪](docs/GoRangeTask-进度跟踪.md)：阶段状态、完成标准和可核验的实现证据。
+- [STAR 说明](docs/GoRangeTask-STAR.md)：项目定位、与手写 SQL 及 Outbox/RabbitMQ 的区别、简历证据框架。
 
 ## 许可
 
-[MIT](LICENSE)
+本项目使用 [MIT License](LICENSE)。
