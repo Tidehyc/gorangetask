@@ -237,12 +237,24 @@ type Client interface {
     Get(ctx context.Context, id TaskID) (TaskInfo, error)
     Cancel(ctx context.Context, id TaskID) error
 }
+
+// ClientConfig 是入队侧配置（与 Worker 的 Config 分开）。零值合法：
+// 缺省字段由 WithDefaults 填充，由 Validate 校验。
+type ClientConfig struct {
+    DefaultQueue       string // 任务未指定 Queue 时使用；默认 "default"
+    DefaultMaxAttempts int    // 任务未指定 MaxAttempts 时使用；默认 10
+    MaxPayloadSize     int    // 单任务 payload 字节上限；默认 256 KiB
+}
 ```
 
 `Task.Timeout` 为逐任务超时（对应需求文档 §7 草案与 §4.2「Handler 执行超时可配置」）：零值表示使用 Worker 级默认 Handler 超时；非零值覆盖本次执行的 Handler 超时。该超时通过传给 Handler 的 `context.Context` 的 deadline 实现，与租约、shutdown 的取消是同一套协作式取消机制。
 
 API 约定：
 
+- `Enqueue` / `EnqueueTx` 共用同一套校验与同一条 INSERT，差别只在“在谁的连接上执行”。校验（必填字段、JSON 合法性、payload 上限、列宽）全部在落库前完成，失败返回可判断的 `ErrInvalidTask` / `ErrInvalidPayload`。
+- `Enqueue` 不额外开启事务：单条 INSERT 本身即原子。立即执行任务的 `run_at` 取 `UTC_TIMESTAMP(6)`，延迟任务由调用方传入 UTC 时刻。
+- 幂等冲突**依赖唯一索引**而不是“先查后插”：后者在并发下必然漏判。空幂等键写入 NULL 而非空串——MySQL 唯一索引不约束 NULL，但会把空串当成真实取值，从而把“没有幂等键”误判成“幂等键重复”。
+- `ErrDuplicateTask` 不返回既有任务 ID：调用方若需要旧任务，应自行按幂等键查询（需求文档未要求该能力，故不作为默认行为）。
 - `EnqueueTx` 的 `Tx` 只要求执行 INSERT 所需的方法，不暴露 Commit/Rollback，避免库误操作调用方事务。
 - GORM adapter 暴露独立入口（具体包名待仓库结构确认），接收 `*gorm.DB` 事务并执行同一 INSERT；adapter 通过传入对象执行，不开启新事务。
 - `Cancel` 只成功取消当前 `pending` 任务；任务已领取、已终态或不存在分别返回可判断的结果/错误。
@@ -262,9 +274,9 @@ Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至
 ├── handler.go            # Handler 类型与 Registry 注册表
 ├── config.go             # Worker 与 Client 配置、默认值与校验
 ├── worker.go             # Worker 生命周期、并发和 shutdown
-├── store/                # MySQL store、claim/lease/retry/reaper SQL
-│   └── mysql/            # 方言实现与迁移
-├── migrations/mysql/     # 版本化 DDL（embed 到 store/mysql）
+├── store/                # MySQL store：Client（入队/查询）、claim/lease/retry/reaper SQL
+│   └── mysql/            # 方言实现（package mysql，导入路径 .../store/mysql）
+├── migrations/mysql/     # 版本化 DDL + runner（package mysqlmigrations，独立包）
 ├── adapter/gorm/         # 可选官方 GORM adapter
 ├── example/basic/        # 业务事务 + EnqueueTx + Handler 示例
 ├── integration/          # 真 MySQL 测试
@@ -275,6 +287,7 @@ Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至
 
 - **根包 `gorangetask` 保留公开契约**：`Task`/`TaskInfo`/`Status`/`Handler`/`Registry`/`Client`/`Tx`/配置/错误。使用者的导入面只有根包，语义一目了然。
 - **`store/` 承载 SQL 与方言**：领取、续租、成功/失败确认、回收、清理等所有语句实现放在 `store/`（MySQL 方言在 `store/mysql`）。根包通过接口依赖 store，不直接写 SQL。
+- **`migrations/mysql` 保持独立包，不并入 `store/mysql`**（2026-10-12 确认）：迁移 DDL 用 `//go:embed` 打包，而 `embed` 不能跨目录向上取文件，若并入 store 就必须把 .sql 搬进 `store/mysql` 目录下。迁移是“建表”这件事的完整闭环（DDL + 版本管理 + runner + 注释剥离），自成一体、已有独立测试；store 只读表、不建表，两者职责不重叠。因此调用方分两步用：先 `mysqlmigrations.Migrate`，再 `mysqlstore.New`。
 - **可选依赖隔离在子包**：GORM adapter 放 `adapter/gorm`，只有使用 GORM 的应用才引入；`migrations` 通过 `embed` 打包，避免运行时依赖外部文件路径。
 - **首版不必一次性建满**：根包在 API 类型阶段已经成形；`config.go`/`worker.go`/`store/` 随对应实现阶段加入，`example`/`integration`/`adapter` 在验证与适配阶段加入。目录只在有真实内容时创建，不提交空占位目录。
 
