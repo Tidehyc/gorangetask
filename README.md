@@ -2,7 +2,7 @@
 
 GoRangeTask 是一个可嵌入 Go 服务的 **MySQL 持久化任务队列**，面向由本服务 Worker 执行的后台任务。
 
-> **项目状态：早期开发中。** 仓库已有任务与配置类型、Handler 注册表、错误定义、MySQL migration、入队 Client（`Enqueue` / `EnqueueTx`，含幂等键）和对应测试；Worker 领取与执行、租约恢复等核心闭环尚未完成。当前文档描述的是目标设计与验收计划，不代表所有功能已经可用。进度见[项目进度跟踪](docs/GoRangeTask-进度跟踪.md)。
+> **项目状态：早期开发中。** 仓库已有任务与配置类型、Handler 注册表、错误定义、MySQL migration，以及**完整的 MySQL Client**（`Enqueue` / `EnqueueTx` / `Get` / `Cancel`，含幂等键）和覆盖它们的单元测试与真库集成测试（CI 已接入 MySQL）。Worker 领取与执行、租约续期与恢复等核心闭环尚未完成。当前文档描述的是目标设计与验收计划，不代表所有功能已经可用。进度见[项目进度跟踪](docs/GoRangeTask-进度跟踪.md)。
 
 ## 项目定位
 

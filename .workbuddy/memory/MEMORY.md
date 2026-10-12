@@ -26,6 +26,9 @@
 - `store/mysql`（package `mysql`）：MySQL 方言实现，唯一直接写 SQL 的地方。
   **只读表，不建表。** `New(db *sql.DB, cfg gorangetask.ClientConfig)`。
   导入该包会顺带注册 go-sql-driver，调用方无需再 import 驱动。
+  **已完整实现根包 `Client` 接口**（Enqueue / EnqueueTx / Get / Cancel），
+  并有编译期断言 `var _ gorangetask.Client = (*Client)(nil)`。
+  Worker 侧的领取/续租/确认/回收 SQL 尚未实现。
 - `migrations/mysql`（package `mysqlmigrations`）：**独立包，不并入 store**。
   理由：`//go:embed` 不能跨目录向上取文件；迁移是「建表」的完整闭环且已有独立测试。
   调用顺序是「先 `mysqlmigrations.Migrate`，再 `mysqlstore.New`」。
@@ -34,9 +37,13 @@
 
 ## 测试约定
 
-- 真 MySQL 集成测试由环境变量 `GOTASK_TEST_MYSQL_DSN` 开启，未设置则 `t.Skip`，
-  所以 CI（不设该变量）只跑单测。
+- 真 MySQL 集成测试由环境变量 `GOTASK_TEST_MYSQL_DSN` 开启，未设置则 `t.Skip`。
   本地示例：`root:rootpw@tcp(127.0.0.1:3306)/gotask_test?parseTime=true&loc=UTC`
+- **CI 已接入 MySQL**（`.github/workflows/ci.yml`）：`mysql:8.0` service container +
+  job 级 `GOTASK_TEST_MYSQL_DSN`，测试步骤 `-v` 并 `tee go-test.log`。
+  **有一个守门步骤：出现任何 `--- SKIP` 即判失败**——`go test` 的退出码不反映"测试被跳过"，
+  集成测试全 skip 时退出码仍是 0，不显式检查就会把"没验证"当成"通过"。
+  新增"合法跳过"的用例前，必须先想清楚它会不会误伤这个守门步骤。
 - **每个集成测试包必须用独立的库**：`go test ./...` 会并发跑不同包，而集成测试 setup 是
   破坏性的（DROP TABLE + 重新 Migrate），共用一个库会互相删表、报出与产品无关的假失败。
   做法：用 `gomysql.ParseDSN` 取库名后加后缀（如 `_store`），再用不带库名的连接
@@ -49,6 +56,7 @@
 - 仓库内不要建临时目录实验：沙箱的 `rm` 是 safe-delete 垫片，会把文件挪进
   `.Trash-0/` 污染 `git status` 与 `gofmt -l`。用 `/bin/rm`，或把实验放到仓库外
   （如 `/home/tide/.cache/`）。`.gitignore` 已加 `.Trash-*/` 兜底。
+- 推送 `.github/workflows/**` 需要 token 带 `workflow` scope（用户已授权过）。
 
 ## 本地开发库
 

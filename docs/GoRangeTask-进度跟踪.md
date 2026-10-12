@@ -47,6 +47,7 @@
 | [x] | 定义 Worker 配置类型与校验 | 配置字段齐备且有默认值与合法性校验 | 2026-10-11 提交 `921e230`：`Config` 16 字段 + 全部默认值常量；`WithDefaults`/`Validate`（包裹 `ErrInvalidConfig`）；`Task.Timeout` 落地；单测覆盖 19 类非法配置，覆盖率 100% |
 | [x] | 建立本地 MySQL 开发环境 | 一条命令启动 MySQL 8，migration 可应用/回滚 | 2026-10-11 容器化 MySQL 8.0.46（`gotask-mysql`）已跑通；`scripts/dev-mysql.sh up` 启停；宿主机未装 mysql-server，环境不被污染 |
 | [x] | 建立 CI 基线 | format、vet、unit test 可在 CI 执行（MySQL integration test 待有集成测试后补） | 2026-10-11 提交 `44f468f`：`.github/workflows/ci.yml`，push/PR 到 main 触发 gofmt→vet→build→test -race；首次运行 `38136967246` **success（29s）**；Go 版本由 go.mod 驱动（CI 实跑 1.24） |
+| [x] | CI 接入 MySQL 集成测试 | 集成测试在 CI 真跑；缺 DSN 静默跳过时 CI 必须失败而不是全绿 | 2026-10-12 提交 `a515fbc`：`.github/workflows/` 加 `mysql:8.0` service container（`mysqladmin ping` 健康检查），job 级 env 设 `GOTASK_TEST_MYSQL_DSN`；测试步骤 `-v` + `tee go-test.log`，新增守门步骤——出现任何 `--- SKIP` 即判失败（因为集成测试缺 DSN 时只会静默 skip，会把"没验证"伪装成"通过"）。本地按同一流程复现：漏配 DSN 时 **33 个用例被跳过、守门会失败**；配好 DSN 时 **0 SKIP**、日志留下 `MySQL server version: 8.0.46`、`go test -race -count=1 ./...` 三个包全过 |
 
 ## 2. 持久化与事务入队
 
@@ -57,9 +58,9 @@
 | [x] | 实现普通 `Enqueue` | 立即/延迟任务能持久化，参数校验和 payload 上限生效 | 2026-10-12 提交 `f560e45`：新增 `store/mysql`（package `mysql`）的 `New`/`Enqueue`。校验全部先于落库（type 必填、payload 非空且是合法 JSON、payload 上限、列宽按**字符数**），失败返回 `ErrInvalidTask`/`ErrInvalidPayload` 而非 MySQL 1406；`run_at` 以固定 UTC 字符串绑定（避免 DSN 的 `loc` 造成时区偏差），零值走 `UTC_TIMESTAMP(6)`；单条 INSERT 不开事务 |
 | [x] | 实现 `EnqueueTx` | 调用方事务提交任务可见、回滚无任务；库不接管事务生命周期 | 2026-10-12 提交 `f560e45`：与 `Enqueue` 共用同一条 INSERT 与同一套校验，只换执行器（内部接口同时被 `*sql.DB` 与 `gorangetask.Tx` 满足）。集成测试验证：提交前事务外可见 0 行、提交后 1 行；回滚后业务行与任务行均为 0；事务内可见 1 行；事务内命中幂等键时把 `ErrDuplicateTask` 交给调用方决定，库自身不回滚不重试 |
 | [x] | 实现幂等键 | 并发同 key 仅一条任务创建，重复返回 `ErrDuplicateTask` | 2026-10-12 提交 `f560e45`：依赖 `uq_gotask_queue_idempotency` 唯一索引，1062 → `ErrDuplicateTask`，不做「先查后插」。**8 协程并发同键连跑 10 轮**：每轮恰好 1 成功 + 7 个 `ErrDuplicateTask`、库里恰好 1 行，未出现 1213 死锁。空幂等键绑 **NULL 而非空串**（绑空串会让同队列第二条无幂等键任务被误判为重复，有专门集成测试守着） |
-| [ ] | 实现状态读取和 pending 取消 | 查询结果稳定；只允许取消 pending | 待实现 |
+| [x] | 实现状态读取和 pending 取消 | 查询结果稳定；只允许取消 pending | 2026-10-12 提交 `5be5957`：`store/mysql` 的 `Get`/`Cancel` 落地，至此**完整实现根包 `Client` 接口**并加上编译期断言 `var _ gorangetask.Client = (*Client)(nil)`。`Get` 只查需要的列（不含 Worker 内部字段 `lease_owner`/`lease_until`/`lease_epoch`）、时间字段一律换算 UTC、无行返回 `ErrNotFound`。`Cancel` 用一条条件更新（`WHERE id=? AND status='pending'`）而非"先查后改"，避免漏判；刻意不校验 `run_at`，所以**已到期但尚未领取仍可取消**；影响 0 行时才补读状态来区分 `ErrNotFound` 与 `ErrNotPending`（错误信息带实际状态，如 `task 42 is running`）；重复取消返回 `ErrNotPending`。新增 14 个真库集成用例逐个覆盖 `running` 与三种终态 |
 
-测试口径（2026-10-12）：`store/mysql` 单测 35 个子用例（校验/归一化/错误分类，不连库）+ 12 个真 MySQL 8.0.46 集成测试；语句覆盖率 98.4%（唯一未覆盖分支是 `LastInsertId()` 报错，实际无法构造）。`go test -race ./...` 全绿；不设 `GOTASK_TEST_MYSQL_DSN` 时集成测试全部 skip，CI 不受影响。
+测试口径（2026-10-12）：`store/mysql` 单测 35 个子用例（校验/归一化/错误分类，不连库）+ **26 个真 MySQL 8.0.46 集成测试**；语句覆盖率 97.0%（未覆盖分支是 `LastInsertId()` 与 `RowsAffected()` 的报错，实际无法构造）。`go test -race -count=1 ./...` 三个包全绿；CI 已配 MySQL service，且出现任何 SKIP 即判失败。
 
 > 集成测试的库隔离：`go test ./...` 会并发运行不同的包，而集成测试的 setup 是破坏性的（`DROP TABLE` + 重新迁移）。因此 `store/mysql` 使用派生库 `<DSN 库名>_store` 并自动创建，避免与 `migrations/mysql` 的集成测试互相删表而报出与产品无关的假失败（`ErrDirty`、`Error 1050 Table already exists`）。新增集成测试包时应取一个独立后缀。
 

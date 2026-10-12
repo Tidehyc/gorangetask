@@ -210,6 +210,33 @@ Reaper 按小批次处理 `running AND lease_until <= UTC_TIMESTAMP(6)`：事务
 
 Cleanup 以小批次选取 `succeeded` 且 `finished_at < UTC_TIMESTAMP(6) - 7 DAY`，以及 `dead` 且超过 30 天的行；按主键删除，避免长事务。保留期可配置。`canceled` 默认按成功任务保留期处理。任务被删除后，其幂等键不再占用唯一键。
 
+### 5.8 状态查询与取消
+
+状态查询只读需要的列，不 `SELECT *`；`lease_owner` / `lease_until` / `lease_epoch` 属于 Worker 内部状态，不进 `TaskInfo`，免得以后加列时无意中暴露内部字段。返回的时间字段一律换算为 UTC，不依赖调用方 DSN 里的 `loc` 设置。
+
+```sql
+SELECT queue_name, task_type, payload, status, run_at,
+       attempt, max_attempts, idempotency_key, last_error,
+       created_at, updated_at, finished_at
+FROM gotask_tasks WHERE id = ?;
+```
+
+取消用一条条件更新，而不是“先查后改”：
+
+```sql
+UPDATE gotask_tasks
+   SET status = 'canceled',
+       finished_at = UTC_TIMESTAMP(6),
+       updated_at  = UTC_TIMESTAMP(6)
+ WHERE id = ? AND status = 'pending';
+```
+
+- `WHERE status = 'pending'` 让判断与写入在同一条语句里完成，不会出现“查到是 pending、改之前被 Worker 领走”的漏判。
+- **不校验 `run_at`**：已到期但尚未被领取的任务仍是 `pending`，按设计仍可取消（§3 状态迁移表）。
+- 不触碰租约字段——`pending` 任务的租约字段本就是 NULL。
+- 只有影响 0 行时才再读一次 `SELECT status`，用来区分“任务不存在”（`ErrNotFound`）和“状态不是 pending”（`ErrNotPending`）。这次补读不包事务：它只是给调用方判断原因用的快照，不承诺更强的一致性。
+- 重复取消同一个任务返回 `ErrNotPending`：`canceled` 是终态，同样不满足“只允许取消 pending”。
+
 ## 6. Go API 草案
 
 ```go
@@ -257,7 +284,9 @@ API 约定：
 - `ErrDuplicateTask` 不返回既有任务 ID：调用方若需要旧任务，应自行按幂等键查询（需求文档未要求该能力，故不作为默认行为）。
 - `EnqueueTx` 的 `Tx` 只要求执行 INSERT 所需的方法，不暴露 Commit/Rollback，避免库误操作调用方事务。
 - GORM adapter 暴露独立入口（具体包名待仓库结构确认），接收 `*gorm.DB` 事务并执行同一 INSERT；adapter 通过传入对象执行，不开启新事务。
-- `Cancel` 只成功取消当前 `pending` 任务；任务已领取、已终态或不存在分别返回可判断的结果/错误。
+- `Get` 返回任务当前状态的快照，不含 Worker 内部字段（`lease_owner` / `lease_until` / `lease_epoch`）；时间字段一律 UTC；任务不存在返回 `ErrNotFound`。
+- `Cancel` 只成功取消当前 `pending` 任务。任务不存在返回 `ErrNotFound`；已领取（`running`）或已处于终态（`succeeded` / `dead` / `canceled`）返回 `ErrNotPending`，错误信息里带上实际状态，便于从日志直接看出原因。重复取消同一个任务因此也返回 `ErrNotPending`（`canceled` 是终态）。
+- 状态判断不提供更强的“结果”抽象：`Cancel` 只返回错误，不回传被取消任务的快照。调用方需要详情时再调 `Get`。
 - `Handler` 注册时由 `task_type` 映射；同一个 type 在同一个 Worker 注册表中不能重复注册。
 - Worker 启动时校验所监听队列和 Handler 注册；未知 task type 的任务进入永久失败路径，避免快速无限重试。
 
