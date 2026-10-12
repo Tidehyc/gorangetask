@@ -13,6 +13,34 @@ jobs:
   test:
     name: format, vet, build, test
     runs-on: ubuntu-latest
+
+    # 集成测试需要一个真 MySQL。用 service container 起一个干净的实例，
+    # 参数与本地 scripts/dev-mysql.sh 对齐（utf8mb4 / utf8mb4_0900_ai_ci）。
+    # MySQL 8.0 的默认字符集已经是 utf8mb4，迁移脚本里也显式声明了，
+    # 所以这里不需要额外传 --character-set-server。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: gotask_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prootpw"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    env:
+      # 集成测试的开关。未设置时集成测试会 t.Skip，所以这个变量一旦漏配，
+      # 测试会"全绿但什么都没验证"——下面的 Test 步骤专门挡这种情况。
+      #
+      # 库名 gotask_test 由 service 预设；store 包的集成测试会自行创建派生库
+      # gotask_test_store，root 用户有权限。parseTime=true 供断言把 DATETIME
+      # 扫成 time.Time，loc=UTC 与库里的 UTC 时间对齐。
+      GOTASK_TEST_MYSQL_DSN: root:rootpw@tcp(127.0.0.1:3306)/gotask_test?parseTime=true&loc=UTC
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -39,4 +67,21 @@ jobs:
         run: go build ./...
 
       - name: Test with race detector
-        run: go test -race -count=1 ./...
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./... 2>&1 | tee go-test.log
+
+      # 集成测试在缺 DSN 或连不上库时会静默 skip，只留一个 "--- SKIP"。
+      # 那看起来和成功没区别，却会把"没验证"伪装成"验证通过"。
+      # 因此在集成测试必须运行的 CI 里，出现任何 SKIP 都判失败。
+      - name: Fail if any test was skipped
+        run: |
+          if grep -q -- '--- SKIP' go-test.log; then
+            echo "::error::检测到被跳过的测试。CI 配了 MySQL，集成测试必须真跑："
+            grep -- '--- SKIP' go-test.log
+            exit 1
+          fi
+          echo "没有测试被跳过。"
+
+      - name: Show MySQL server version
+        run: grep -E 'MySQL server version' go-test.log || true
