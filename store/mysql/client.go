@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	gomysql "github.com/go-sql-driver/mysql"
@@ -82,6 +83,9 @@ type Client struct {
 	db  *sql.DB
 	cfg gorangetask.ClientConfig
 }
+
+// 编译期断言：Client 完整实现了根包的公开接口。
+var _ gorangetask.Client = (*Client)(nil)
 
 // New 构造一个 MySQL Client。db 不能为 nil。
 //
@@ -235,4 +239,107 @@ func isDuplicateEntry(err error) bool {
 		return me.Number == mysqlErrDuplicateEntry
 	}
 	return false
+}
+
+// selectTaskSQL 按主键读取一条任务的当前状态（Get）。
+//
+// 只查需要的列，不 SELECT *：让"哪些字段会返回给调用方"在代码里一目了然，
+// 也避免以后加列时无意中把内部字段暴露出去。
+// lease_owner / lease_until / lease_epoch 属于 Worker 内部状态，不进 TaskInfo。
+const selectTaskSQL = `SELECT
+    queue_name, task_type, payload, status, run_at,
+    attempt, max_attempts, idempotency_key, last_error,
+    created_at, updated_at, finished_at
+FROM ` + tasksTable + ` WHERE id = ?`
+
+// cancelTaskSQL 只取消仍是 pending 的任务。
+//
+// 刻意不校验 run_at：已到期但尚未被领取的任务仍是 pending，按设计仍可取消
+// （技术设计 §4 状态迁移表）。也不触碰租约字段——pending 任务的租约字段本就是 NULL。
+// 用 WHERE status = 'pending' 而不是"先查后改"：条件更新是原子的，
+// 不会出现"查到是 pending、更新前被 Worker 领走"的漏判。
+const cancelTaskSQL = `UPDATE ` + tasksTable + `
+    SET status = 'canceled', finished_at = UTC_TIMESTAMP(6), updated_at = UTC_TIMESTAMP(6)
+    WHERE id = ? AND status = 'pending'`
+
+// currentStatusSQL 在取消影响 0 行时用来区分"任务不存在"和"状态不是 pending"。
+const currentStatusSQL = `SELECT status FROM ` + tasksTable + ` WHERE id = ?`
+
+// Get 按 ID 返回任务的当前状态，任务不存在时返回 ErrNotFound。
+//
+// 返回的时间字段一律换算为 UTC，避免调用方因为自己 DSN 里的 loc 设置
+// 拿到本地时区的值。
+func (c *Client) Get(ctx context.Context, id gorangetask.TaskID) (gorangetask.TaskInfo, error) {
+	var (
+		info                        gorangetask.TaskInfo
+		queue, taskType, status     string
+		payload                     []byte
+		runAt, createdAt, updatedAt time.Time
+		idempotencyKey, lastError   sql.NullString
+		finishedAt                  sql.NullTime
+	)
+
+	err := c.db.QueryRowContext(ctx, selectTaskSQL, int64(id)).Scan(
+		&queue, &taskType, &payload, &status, &runAt,
+		&info.Attempt, &info.MaxAttempts, &idempotencyKey, &lastError,
+		&createdAt, &updatedAt, &finishedAt,
+	)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return gorangetask.TaskInfo{}, fmt.Errorf("%w: task %d", gorangetask.ErrNotFound, id)
+	case err != nil:
+		return gorangetask.TaskInfo{}, fmt.Errorf("gorangetask/store/mysql: get task: %w", err)
+	}
+
+	info.ID = id
+	info.Queue = queue
+	info.Type = taskType
+	info.Payload = json.RawMessage(payload)
+	info.Status = gorangetask.Status(status)
+	info.RunAt = runAt.UTC()
+	info.CreatedAt = createdAt.UTC()
+	info.UpdatedAt = updatedAt.UTC()
+	if idempotencyKey.Valid {
+		info.IdempotencyKey = idempotencyKey.String
+	}
+	if lastError.Valid {
+		info.LastError = lastError.String
+	}
+	if finishedAt.Valid {
+		info.FinishedAt = finishedAt.Time.UTC()
+	}
+	return info, nil
+}
+
+// Cancel 取消一个尚未被领取的 pending 任务。
+//
+// 任务不存在返回 ErrNotFound；任务已领取（running）或已处于终态
+// （succeeded / dead / canceled）返回 ErrNotPending，错误信息里带上实际状态，
+// 便于调用方在日志里直接看出原因。重复取消同一个任务因此也返回 ErrNotPending：
+// canceled 是终态，不再满足"只允许取消 pending"的条件。
+func (c *Client) Cancel(ctx context.Context, id gorangetask.TaskID) error {
+	res, err := c.db.ExecContext(ctx, cancelTaskSQL, int64(id))
+	if err != nil {
+		return fmt.Errorf("gorangetask/store/mysql: cancel task: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("gorangetask/store/mysql: cancel task: %w", err)
+	}
+	if affected > 0 {
+		return nil
+	}
+
+	// 影响 0 行只说明"没取消成功"，还得再读一次状态才能给出可判断的错误。
+	// 这里不包事务：读到的状态只是刚才那一瞬的快照，够调用方判断原因了，
+	// 不承诺更强的一致性；反正任务只要不是 pending，取消本来就该失败。
+	var status string
+	switch err := c.db.QueryRowContext(ctx, currentStatusSQL, int64(id)).Scan(&status); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: task %d", gorangetask.ErrNotFound, id)
+	case err != nil:
+		return fmt.Errorf("gorangetask/store/mysql: read task status: %w", err)
+	}
+	return fmt.Errorf("%w: task %d is %s", gorangetask.ErrNotPending, id, status)
 }

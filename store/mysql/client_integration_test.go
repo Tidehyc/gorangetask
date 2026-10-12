@@ -112,6 +112,23 @@ func ensureDatabase(parsed *gomysql.Config, name string) error {
 	return err
 }
 
+// TestMySQLServerVersionIsSupported 把"实测在哪个 MySQL 上跑"写进测试日志，
+// 并挡住用错镜像的情况（例如误配 MariaDB：它的版本号是 10.x）。
+// 项目只验证 MySQL 8.0+，所以这里断言主版本是 8 或 9。
+func TestMySQLServerVersionIsSupported(t *testing.T) {
+	_, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+
+	var version string
+	if err := db.QueryRowContext(context.Background(), "SELECT VERSION()").Scan(&version); err != nil {
+		t.Fatalf("read server version: %v", err)
+	}
+	t.Logf("MySQL server version: %s", version)
+
+	if !strings.HasPrefix(version, "8.") && !strings.HasPrefix(version, "9.") {
+		t.Errorf("server version %q is not MySQL 8.0+; this project only verifies MySQL 8.0+", version)
+	}
+}
+
 // dbNow 取数据库当前时间。所有时间断言都以数据库时钟为准，避免把测试机器
 // 的时钟差异当成产品缺陷（技术设计 §3.2 的同一思路）。
 func dbNow(t *testing.T, db *sql.DB) time.Time {
