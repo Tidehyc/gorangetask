@@ -126,18 +126,41 @@ golang-migrate 的做法值得借鉴，我们的实现采用同样的思路：
 
 ### 一个具体例子
 
-```
-$ ./app   # 第一次运行，0001 执行到一半失败
-error: migration 1 (create_tasks_table) failed: Error 1060: Duplicate column name 'foo'
-       database is in a dirty state; manual intervention required
+下面是实现后的真实输出（场景：库里已存在同名表，导致 0001 的 `CREATE TABLE` 失败）。
 
-  人工检查：SHOW CREATE TABLE gotask_tasks;   -- 看实际结构
-  人工修复：把多余的那半截结构对齐到预期状态
-  清除标记：UPDATE gotask_schema_migrations SET dirty=0 WHERE version=1;
-           或   DELETE FROM gotask_schema_migrations WHERE version=1;  -- 若想整条重跑
+第一次运行 —— 直接报出失败位置，并说明 DDL 无法回滚：
 
-$ ./app   # 再次运行，现在能正常继续
+```text
+gorangetask/migrate: version 1 (create_tasks_table) statement 1/1 failed:
+  Error 1050 (42S01): Table 'gotask_tasks' already exists;
+  MySQL DDL cannot be rolled back, the schema may be partially changed — manual intervention required
 ```
+
+此时元数据表里留下了 `version=1, dirty=1`。第二次运行 —— 被拒绝：
+
+```text
+gorangetask/migrate: database is in a dirty state:
+  affected version(s): 1 (create_tasks_table);
+  inspect the actual schema, align it with expectations, then clear the dirty flag
+```
+
+人工恢复：
+
+```sql
+SHOW CREATE TABLE gotask_tasks;                       -- 看实际结构
+-- 把结构对齐到预期状态后，清除失败记录：
+DELETE FROM gotask_schema_migrations WHERE version = 1;   -- 该版本将整条重跑
+-- 或者保留记录、只清标记（结构与预期一致时）：
+UPDATE gotask_schema_migrations SET dirty = 0 WHERE version = 1;
+```
+
+再次运行 `Migrate` —— 恢复正常：
+
+```text
+Migrate 成功
+```
+
+这段输出是 2026-10-12 在 MySQL 8.0.46 上实测所得，并有对应的自动化测试覆盖（`TestMigrateIntegrationMarksDirtyOnFailure`）。
 
 ## 5. 并发安全：为什么需要 advisory lock
 
