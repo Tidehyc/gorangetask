@@ -60,6 +60,7 @@ GoRangeTask 处理的是**本服务要执行的 Job**（生产者与 Handler 同
 
 - [需求文档](docs/GoRangeTask-需求文档.md)：目标、非目标、P0/P1 功能需求、状态机、数据存储、API 与配置草案、可观测性与验收标准。
 - [技术设计](docs/GoRangeTask-技术设计.md)：数据模型 DDL、领取/续租/确认/回收/清理 SQL、Go API 草案、包结构与验证计划。
+- [迁移机制](docs/GoRangeTask-迁移机制.md)：数据库迁移的原理、MySQL DDL 不可回滚与脏状态、advisory lock、多语句处理及实测验证记录。
 - [进度跟踪](docs/GoRangeTask-进度跟踪.md)：对照需求的完成状态与证据。
 - [STAR 说明](docs/GoRangeTask-STAR.md)：项目背景、与 Outbox/RabbitMQ 的边界、简历证据框架。
 
