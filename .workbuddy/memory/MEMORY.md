@@ -73,3 +73,13 @@
   **NULL 不参与唯一性判断** ⇒ 空幂等键必须写 NULL，写空串会被误判为重复。
 - 时间列一律 UTC；参与时序判断的值以数据库为准（SQL 里用 `UTC_TIMESTAMP(6)`）。
 - 领取用 `FOR UPDATE SKIP LOCKED`（尚未实现）。
+
+## 错误模型（2026-10-13 定）
+
+- 失败只分两类：**可重试** 与 **永久失败**。「重试没意义」用 `Permanent(err)` 打标记
+  （私有 `permanentError` 类型 + `IsPermanent`），**不新增公开哨兵** —— 调用方不会
+  因漏包一层把永久失败当可重试。`Permanent(nil)==nil`、可重复标记、`errors.Is/As` 穿透。
+  Worker 见到永久标记 ⇒ 任务直接进 `dead`。
+- **payload 解码收进库**：`TypedHandler[T]` 泛型适配器，解码失败 → 永久 `ErrInvalidPayload`；
+  未知 task type → `Registry.Resolve` 返回永久 `ErrNoHandler`（`Lookup` 刻意不打标记）。
+- `TypedHandler` 的 `fn == nil` 在**构造期 panic**（启动配置错误尽早暴露）。
