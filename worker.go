@@ -85,24 +85,25 @@ type WorkerStore interface {
 //
 //	w, err := gorangetask.NewWorker(store, registry, cfg)
 //	if err != nil { ... }
-//	go w.Run(ctx)          // ctx 取消即停止领取
+//	go w.Run(ctx)          // ctx 取消即优雅停机
 //
 // 本项（进度跟踪 §3「单 Worker claim/execute/ack」）已实现的语义：
 //   - 领取：一次 claim 周期内先提交事务，再执行 Handler，顺序有保证。
 //   - 并发：Run 按 Config.Concurrency 起同等数量的 goroutine，各自独立领取。
 //   - 成功：写回 succeeded 终态。
 //   - 失败：写回 pending 立即重试；若尝试次数已耗尽则写为 dead。
+//   - 优雅停机（§3「Worker graceful shutdown」）：见 Run 的说明。
 //
 // 尚未实现的语义（后续工作项，文档已排期）：
 //   - **租约续期（§4）**：Handler 必须能在 LeaseDuration 内结束。超时后租约过期，
 //     本次写回会被 fencing 拒绝（ErrLeaseLost），任务要等回收器（§4）才能重领。
-//   - **租约丢失取消 context（§4）**：Handler 不会因失租被提前取消。
-//   - **回收器（§4）**：进程崩溃留下的 running 任务暂无人回收。
+//   - **租约丢失取消 context（§4）**：Handler 不会因失租被提前取消；它只观察停机取消。
+//   - **回收器（§4）**：进程崩溃、停机超时留下的 running 任务暂无人回收，
+//     只能等租约过期（目前没有任何组件会去捡它们）。
 //   - **指数退避与永久错误（§4）**：失败一律立即重试，不区分 Permanent，
 //     也不做退避；因此永久失败的任务会尝试到次数耗尽才进入 dead。
 //   - **panic 隔离（§4）**：Handler panic 会向上冒泡，尚未被单任务边界拦截。
-//   - **优雅停机（§3 最后一行）**：ctx 取消即刻停止领取，不等待在途 Handler。
-//   - **可观测性（§5）**：基础设施错误目前没有公开出口。
+//   - **可观测性（§5）**：基础设施错误目前没有公开出口，只能通过内部 onError 观察。
 type Worker struct {
 	store    WorkerStore
 	registry *Registry
@@ -151,8 +152,27 @@ func NewWorker(store WorkerStore, registry *Registry, cfg Config) (*Worker, erro
 // PollInterval 起、指数退避至 MaxPollInterval 并加抖动，避免空队列时的
 // 高频轮询；一旦领到任务就把退避重置回 PollInterval。
 //
+// # 优雅停机
+//
+// ctx 取消即触发停机，按三步走：
+//
+//  1. **停止领取新任务**：各循环在下一轮开头发现 ctx 已取消就退出，不再 Claim。
+//  2. **通知在途 Handler**：Handler 拿到的 context 派生自 ctx，取消会传到它手里。
+//     这是协作式取消——Handler 必须自己观察 ctx 才会提前返回，库无法强杀它。
+//  3. **在 ShutdownTimeout 内等待退出**：超时后 Run 不再等待，返回
+//     ErrShutdownTimeout；没退回的 Handler 连同它们的任务一起被放弃。
+//
+// 停机期间**不写回失败**。Handler 因停机被取消而返回的错误不代表任务真的失败；
+// 把它写回 pending 会让另一个 Worker 立刻重跑，而旧 Handler 的业务副作用可能
+// 仍在途。因此这类任务保持 running，等租约自然过期后由回收器恢复
+// （需求文档 §4.6「不提前把租约释放给其他 Worker」）。
+//
+// 已经**成功返回**的 Handler 仍然会尽力确认：它已明确结束，确认它不会造成并行
+// 执行，还能省掉一次重复。确认时改用一个脱离停机取消、只保留 ShutdownTimeout
+// 作为预算的 context，否则这条本来成功的结果会连带被取消写不回去。
+//
 // 单个任务执行失败不会中断循环：失败会被写回存储（pending 重试或 dead）。
-// ctx 取消后 Run 返回 nil。
+// 正常停机（所有 Handler 都在 ShutdownTimeout 内退出）返回 nil。
 func (w *Worker) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Concurrency; i++ {
@@ -162,8 +182,29 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.loop(ctx)
 		}()
 	}
-	wg.Wait()
-	return nil
+
+	// 所有循环都只在 ctx 取消后才退出（每个 loop 都在轮次开头检查 ctx），
+	// 因此这里直接等停机信号。wg.Wait() 放在独立 goroutine 里，是为了让
+	// 下面的有界等待能同时观察"循环已经全部结束"。
+	loopsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(loopsDone)
+	}()
+
+	<-ctx.Done()
+
+	// 在途 Handler 拿到的 context 派生自 ctx，取消已经传到它们手里；这里只等
+	// 它们在 ShutdownTimeout 内返回，不为不理会取消的 Handler 无限期阻塞。
+	timer := time.NewTimer(w.cfg.ShutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-loopsDone:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("%w: %s elapsed with handlers still running", ErrShutdownTimeout, w.cfg.ShutdownTimeout)
+	}
 }
 
 // loop 是一个 goroutine 的领取循环。
@@ -212,7 +253,14 @@ func (w *Worker) runOnce(ctx context.Context) (int, error) {
 
 	// 领取事务已经提交，此时任务在库里已是 running 且带着本次的 owner/epoch；
 	// 从这里开始执行 Handler 不会持有任何数据库事务或行锁。
-	for _, task := range claimed {
+	for i, task := range claimed {
+		// 停机已经开始就不再启动批次里剩下的 Handler：它们一启动就会拿到已
+		// 取消的 context，等于把任务领出来又立刻放弃。保持 running 交给回收器，
+		// 比"启动了再取消"更干净。
+		if ctx.Err() != nil {
+			w.report(fmt.Errorf("shutdown in progress; %d claimed task(s) left running for the reaper", len(claimed)-i))
+			break
+		}
 		w.process(ctx, task)
 	}
 	return len(claimed), nil
@@ -221,11 +269,39 @@ func (w *Worker) runOnce(ctx context.Context) (int, error) {
 // process 执行一条已领取的任务并写回结果。它不返回 error：任务的失败是
 // 预期内的结果，写回存储即可；写回本身失败才通过 report 上报。
 func (w *Worker) process(ctx context.Context, task ClaimedTask) {
-	if err := w.execute(ctx, task); err != nil {
+	err := w.execute(ctx, task)
+
+	// 停机进行中：这次失败是被取消掉的，不代表任务真的失败，不能写回
+	// （写回 pending 会让别的 Worker 在旧副作用可能仍在途时立刻重跑）。
+	if ctx.Err() != nil {
+		if err == nil {
+			w.ack(ctx, task)
+			return
+		}
+		w.report(fmt.Errorf("shutdown in progress; task %d left running for the reaper: %w", task.ID, err))
+		return
+	}
+
+	if err != nil {
 		w.fail(ctx, task, err)
 		return
 	}
-	if err := w.store.Succeed(ctx, task); err != nil {
+	w.ack(ctx, task)
+}
+
+// ack 把一条执行成功的任务写回 succeeded 终态。
+//
+// 正常运行时直接用 ctx。停机期间 ctx 已被取消，此时换用一个脱离该取消、
+// 只保留 Config.ShutdownTimeout 作为预算的 context——否则这条已经成功的
+// 结果会因为停机取消写不回去，白白多执行一次。
+func (w *Worker) ack(ctx context.Context, task ClaimedTask) {
+	ackCtx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ackCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), w.cfg.ShutdownTimeout)
+		defer cancel()
+	}
+	if err := w.store.Succeed(ackCtx, task); err != nil {
 		// 写回失败通常是租约过期/易主（ErrLeaseLost）。按设计不做无条件更新补救，
 		// 任务的最终命运交给回收器。
 		w.report(fmt.Errorf("ack success for task %d: %w", task.ID, err))

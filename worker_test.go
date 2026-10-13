@@ -30,6 +30,11 @@ type fakeStore struct {
 
 	// onSucceed 在成功确认后被调用（用于测试里等待异步处理完成）。
 	onSucceed func(TaskID)
+
+	// honourCtx 为 true 时，写回方法像真实驱动那样在 ctx 已取消时直接失败。
+	// 用于证明"停机期间的成功确认确实换用了脱离取消的 context"——否则这个
+	// 开关一开，停机中的确认就会（错误地）失败。
+	honourCtx bool
 }
 
 type retryCall struct {
@@ -59,7 +64,11 @@ func (f *fakeStore) Claim(_ context.Context, spec ClaimSpec) ([]ClaimedTask, err
 	return batch, nil
 }
 
-func (f *fakeStore) Succeed(_ context.Context, task ClaimedTask) error {
+func (f *fakeStore) Succeed(ctx context.Context, task ClaimedTask) error {
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	f.succeeded = append(f.succeeded, task.ID)
 	hook, err := f.onSucceed, f.succeedErr
@@ -71,7 +80,11 @@ func (f *fakeStore) Succeed(_ context.Context, task ClaimedTask) error {
 	return err
 }
 
-func (f *fakeStore) Retry(_ context.Context, task ClaimedTask, delay time.Duration, lastError string) error {
+func (f *fakeStore) Retry(ctx context.Context, task ClaimedTask, delay time.Duration, lastError string) error {
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -79,12 +92,26 @@ func (f *fakeStore) Retry(_ context.Context, task ClaimedTask, delay time.Durati
 	return f.retryErr
 }
 
-func (f *fakeStore) MarkDead(_ context.Context, task ClaimedTask, lastError string) error {
+func (f *fakeStore) MarkDead(ctx context.Context, task ClaimedTask, lastError string) error {
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.dead = append(f.dead, deadCall{task: task, lastError: lastError})
 	return f.deadErr
+}
+
+// ctxErr 在开了 honourCtx 时把 ctx 的取消状态当作驱动错误返回。
+func (f *fakeStore) ctxErr(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.honourCtx {
+		return ctx.Err()
+	}
+	return nil
 }
 
 func (f *fakeStore) specs() []ClaimSpec {
@@ -753,5 +780,246 @@ func TestWorkerRunStopsWhenCancelledDuringBatch(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run() did not return after being canceled mid-batch")
+	}
+}
+
+// TestWorkerShutdownCancelsInFlightHandlerAndDoesNotWriteBack 固化停机的核心约定：
+// ctx 取消会传到在途 Handler 手里；它因停机返回的错误**不写回存储**——把这种
+// "被取消"当成任务失败写回 pending，会让另一个 Worker 在旧副作用可能仍在途时
+// 立刻重跑（需求文档 §4.6）。任务保持 running，等租约过期由回收器恢复。
+func TestWorkerShutdownCancelsInFlightHandlerAndDoesNotWriteBack(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(41, "t", 1, 3)}}}
+
+	started := make(chan struct{})
+	sawCancel := make(chan error, 1)
+	reg := NewRegistry()
+	if err := reg.Register("t", func(ctx context.Context, _ json.RawMessage) error {
+		close(started)
+		<-ctx.Done() // 只观察取消，不做业务
+		sawCancel <- ctx.Err()
+		return ctx.Err()
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+	// 先取消，再等 Handler 观察取消：这样"取消传到了 Handler 手里"与
+	// "Run 在超时内返回"两件事都能被观察到。
+	cancel()
+
+	select {
+	case err := <-sawCancel:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("handler saw context error %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was never cancelled by shutdown")
+	}
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil (handler exited within ShutdownTimeout)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	if n := len(store.retryCalls()); n != 0 {
+		t.Errorf("retried %d time(s), want 0: a shutdown-cancelled task must not be released early", n)
+	}
+	if n := len(store.deadCalls()); n != 0 {
+		t.Errorf("marked %d dead, want 0: a shutdown-cancelled task is not a real failure", n)
+	}
+	if n := len(store.succeededIDs()); n != 0 {
+		t.Errorf("succeeded %d, want 0: the handler never completed", n)
+	}
+}
+
+// TestWorkerShutdownTimeoutAbandonsStuckHandler 覆盖"Handler 不理会 ctx"：
+// Run 必须在 ShutdownTimeout 之后带着 ErrShutdownTimeout 返回，而不是无限等待。
+func TestWorkerShutdownTimeoutAbandonsStuckHandler(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(43, "t", 1, 3)}}}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	// 用例结束后放走被放弃的 goroutine，避免它一直挂着。
+	t.Cleanup(func() { close(release) })
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		close(started)
+		<-release // 故意无视 ctx 的 Handler：这类只能靠超时放弃
+		return errors.New("released after the worker gave up")
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	begin := time.Now()
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrShutdownTimeout) {
+			t.Fatalf("Run() = %v, want ErrShutdownTimeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return; it must give up after ShutdownTimeout")
+	}
+
+	// Handler 一直不退出，因此 Run 只能等满整个预算才放弃——这也顺带证明
+	// 它没有提前返回。
+	if elapsed := time.Since(begin); elapsed < cfg.ShutdownTimeout {
+		t.Errorf("Run() gave up after %s, want it to wait at least ShutdownTimeout (%s)", elapsed, cfg.ShutdownTimeout)
+	}
+}
+
+// TestWorkerShutdownAcksHandlerThatFinishedInTime 覆盖停机期间的"已完成"路径：
+// Handler 在停机开始后仍然成功返回时，结果必须被确认——它已明确结束，确认不会
+// 造成并行执行。store 开了 honourCtx（像真驱动一样拒绝已取消的 ctx），因此这条
+// 断言只有在确认确实换用了脱离取消的 context 时才能通过。
+func TestWorkerShutdownAcksHandlerThatFinishedInTime(t *testing.T) {
+	store := &fakeStore{
+		batches:   [][]ClaimedTask{{claimedTask(47, "t", 1, 3)}},
+		honourCtx: true,
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		close(started)
+		<-release // 先挂住，等停机开始之后才成功返回
+		return nil
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+	cancel()       // 先停机……
+	close(release) // ……再让已经干完活的 Handler 返回
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 47 {
+		t.Errorf("succeeded = %v, want [47]: a handler that completed must still be acked", got)
+	}
+}
+
+// TestWorkerStopsLaunchingHandlersAfterShutdown 覆盖批内停机：ctx 在批次执行
+// 途中被取消时，批内剩下的任务不再启动 Handler（保持 running 交给回收器），
+// 整批都不产生任何写回。
+func TestWorkerStopsLaunchingHandlersAfterShutdown(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{
+		claimedTask(51, "t", 1, 3),
+		claimedTask(52, "t", 1, 3),
+		claimedTask(53, "t", 1, 3),
+	}}}
+
+	var (
+		mu  sync.Mutex
+		ran int
+	)
+	started := make(chan struct{})
+	reg := NewRegistry()
+	if err := reg.Register("t", func(ctx context.Context, _ json.RawMessage) error {
+		mu.Lock()
+		ran++
+		first := ran == 1
+		mu.Unlock()
+		if first {
+			close(started)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.BatchSize = 3 // 让三条任务落在同一批里
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	mu.Lock()
+	got := ran
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("handler ran %d time(s), want 1: shutdown must stop launching more handlers", got)
+	}
+	if r, d, s := len(store.retryCalls()), len(store.deadCalls()), len(store.succeededIDs()); r != 0 || d != 0 || s != 0 {
+		t.Errorf("write-backs during shutdown: retried=%d dead=%d succeeded=%d, want all 0", r, d, s)
 	}
 }

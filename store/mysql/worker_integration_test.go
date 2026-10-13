@@ -1282,6 +1282,91 @@ func waitForSucceededCount(t *testing.T, db *sql.DB, queue string, want int, tim
 	}
 }
 
+// --- 优雅停机 ---------------------------------------------------------------
+
+// TestShutdownLeavesCancelledTaskRunningForTheReaper 把"停机不提前释放租约"钉在
+// 真库上（需求文档 §4.6）。
+//
+// Worker 停机时正在执行的 Handler 会被取消。它的任务必须**留在 running**：
+//   - 不能写回 pending——那会让另一个 Worker 在旧副作用可能仍在途时立刻重跑；
+//   - 也不能写为终态——它并没有成功。
+//
+// 租约保持有效直到自然过期，之后交给回收器（§4 待实现）。用例顺带固定"停机不消耗
+// 尝试次数、不写 last_error"：被取消的执行不是一次真正的失败。
+func TestShutdownLeavesCancelledTaskRunningForTheReaper(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const queue = "q-shutdown"
+	id, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   queue,
+		Type:    "slow.task",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	started := make(chan struct{})
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "slow.task", func(hctx context.Context, _ json.RawMessage) error {
+		close(started)
+		<-hctx.Done() // 只等停机取消，不做业务
+		return hctx.Err()
+	})
+
+	w, err := gorangetask.NewWorker(c, reg, workerConfig(queue))
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(runCtx) }()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// 停机前先确认它真的已经被领走：status=running 且带租约。
+	if before := readTask(t, db, id); before.status != string(gorangetask.StatusRunning) {
+		t.Fatalf("status before shutdown = %q, want running", before.status)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil (the handler honoured the cancellation)", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	row := readTask(t, db, id)
+	if row.status != string(gorangetask.StatusRunning) {
+		t.Errorf("status after shutdown = %q, want running: 停机不能把任务提前释放", row.status)
+	}
+	if !row.leaseOwner.Valid || !row.leaseUntil.Valid {
+		t.Errorf("lease cleared after shutdown: owner=%v until=%v, want it kept for the reaper",
+			row.leaseOwner, row.leaseUntil)
+	}
+	if row.finishedAt.Valid {
+		t.Errorf("finished_at = %v after shutdown, want NULL", row.finishedAt.Time)
+	}
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1: 被取消的执行不该额外消耗一次尝试", row.attempt)
+	}
+	if row.leaseEpoch != 1 {
+		t.Errorf("lease_epoch = %d, want 1: 停机不该改变租约代数", row.leaseEpoch)
+	}
+	if row.lastError.Valid {
+		t.Errorf("last_error = %q after shutdown, want NULL: 被取消不等于失败", row.lastError.String)
+	}
+}
+
 // --- 小工具 ---------------------------------------------------------------
 
 func mustDecode(t *testing.T, raw json.RawMessage) any {

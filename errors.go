@@ -30,6 +30,13 @@ var (
 	// ErrLeaseLost 表示当前执行者已失去任务租约，无法写回状态。
 	// 出现该错误时，本次执行的结果不得覆盖任务记录。
 	ErrLeaseLost = errors.New("gorangetask: lease lost")
+
+	// ErrShutdownTimeout 表示优雅停机时，在 ShutdownTimeout 内仍有 Handler
+	// 没有退出，Run 已放弃等待它们。
+	//
+	// 这是一个生命周期信号，不是任务失败：被放弃的 Handler 及其任务都没有
+	// 被写回，任务保持 running，等租约自然过期后由回收器恢复。
+	ErrShutdownTimeout = errors.New("gorangetask: shutdown timed out")
 )
 
 // permanentError 给错误打上"重试没有意义"的标记。
