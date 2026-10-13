@@ -276,6 +276,8 @@ type ClientConfig struct {
 
 `Task.Timeout` 为逐任务超时（对应需求文档 §7 草案与 §4.2「Handler 执行超时可配置」）：零值表示使用 Worker 级默认 Handler 超时；非零值覆盖本次执行的 Handler 超时。该超时通过传给 Handler 的 `context.Context` 的 deadline 实现，与租约、shutdown 的取消是同一套协作式取消机制。
 
+> **已知缺口（2026-10-13）**：`Task.Timeout` 目前没有对应的数据库列，任务一旦被领取就无法还原它，因此第一个实现只使用 Worker 级默认超时——逐任务超时实际不生效。补一列持久化该值已列入[进度跟踪](./GoRangeTask-进度跟踪.md)（§3「持久化逐任务超时」）。
+
 API 约定：
 
 - `Enqueue` / `EnqueueTx` 共用同一套校验与同一条 INSERT，差别只在“在谁的连接上执行”。校验（必填字段、JSON 合法性、payload 上限、列宽）全部在落库前完成，失败返回可判断的 `ErrInvalidTask` / `ErrInvalidPayload`。

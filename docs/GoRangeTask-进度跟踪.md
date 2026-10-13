@@ -2,7 +2,7 @@
 
 > 用途：对照需求和技术设计追踪项目完成情况；每项完成后补充提交、测试日志、基准结果或文档链接作为证据。
 > 当前状态：构建阶段
-> 更新日期：2026-10-12
+> 更新日期：2026-10-13
 > 核心依据：[GoRangeTask-需求文档.md](./GoRangeTask-需求文档.md)、[GoRangeTask-技术设计.md](./GoRangeTask-技术设计.md)、[GoRangeTask-STAR.md](./GoRangeTask-STAR.md)
 
 ## 项目身份
@@ -62,6 +62,8 @@
 
 测试口径（2026-10-12）：`store/mysql` 单测 35 个子用例（校验/归一化/错误分类，不连库）+ **26 个真 MySQL 8.0.46 集成测试**；语句覆盖率 97.0%（未覆盖分支是 `LastInsertId()` 与 `RowsAffected()` 的报错，实际无法构造）。`go test -race -count=1 ./...` 三个包全绿；CI 已配 MySQL service，且出现任何 SKIP 即判失败。
 
+测试口径（2026-10-13）：新增根包 **22 个 Worker 单测**（内存假 store，不连库；含「Handler 内栅栏」用例证明并发池确有 N 个同时运行，根包覆盖率 100%）与 `store/mysql` **21 个 Worker 真库集成用例**（到期/队列/limit/顺序/不重复领取、epoch 与 attempt 递增、claim 走 `ix_gotask_claim` 且 `Using index`、三种写回的正常与 fencing 拒绝、延迟与 `last_error` 截断、三个端到端）。全量 `go test -race -count=1 ./...`：**236 个用例记录（116 顶层 + 120 子用例）、0 FAIL、0 SKIP**；`store/mysql` 语句覆盖率 93.1%（未覆盖的是驱动层报错分支，如 `BeginTx`/`Exec`/`RowsAffected` 自身失败，无法在真实驱动上构造）。
+
 > 集成测试的库隔离：`go test ./...` 会并发运行不同的包，而集成测试的 setup 是破坏性的（`DROP TABLE` + 重新迁移）。因此 `store/mysql` 使用派生库 `<DSN 库名>_store` 并自动创建，避免与 `migrations/mysql` 的集成测试互相删表而报出与产品无关的假失败（`ErrDirty`、`Error 1050 Table already exists`）。新增集成测试包时应取一个独立后缀。
 
 ## 3. Worker 执行闭环
@@ -69,9 +71,10 @@
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
 | [x] | Handler 注册与 payload 解码 | task type 映射、未知类型处理、schema 错误路径明确 | 2026-10-12 提交 `e2c4147`：`Registry.Resolve` 对未注册类型返回带永久标记的 `ErrNoHandler`（task_type 是入队时定死的值，重试不会让它变得可处理 ⇒ 直接进 dead）；`TypedHandler[T]` 把 `json.Unmarshal` 收进库，解码失败返回带永久标记的 `ErrInvalidPayload`（覆盖"无法解码 payload 不能无限快速重试"），nil 函数构造期 panic；`Permanent`/`IsPermanent` 用私有类型打标记，nil 安全、可重复、`errors.Is`/`As` 仍可穿透。根包覆盖率 100% |
-| [ ] | 单 Worker claim/execute/ack | handler 在 claim 事务提交后运行；成功写回终态 | 待实现 |
+| [x] | 单 Worker claim/execute/ack | handler 在 claim 事务提交后运行；成功写回终态 | 2026-10-13 提交 `4abcf9b`：根包新增执行侧契约 `WorkerStore`（`Claim`/`Succeed`/`Retry`/`MarkDead`，根包只依赖接口不写 SQL）与 `Worker`；`Run` 按 `Config.Concurrency` 起等量 goroutine，各自「领取一批 → 逐条执行 → 写回」，空队列时指数退避至 `MaxPollInterval` 并加抖动、领到任务即重置；Handler 的超时用 `cfg.HandlerTimeout` 作为 ctx deadline。**claim 两段式**（store/mysql）：事务内只 `SELECT id ... FOR UPDATE SKIP LOCKED`（只为停在覆盖索引 `ix_gotask_claim` 上——把 payload 一起取出来覆盖索引就没了）并逐条条件更新为 `running`（置 owner/`lease_until`、`lease_epoch+1`、`attempt+1`），**提交之后**才按主键回读整行，因此 Handler 绝不在事务/行锁内运行。三种写回共用 `(id, status='running', owner, epoch, lease_until 未过期)` 四重 fencing，影响 0 行 → `ErrLeaseLost`；`run_at`/`lease_until` 一律用数据库时钟（`TIMESTAMPADD` + `UTC_TIMESTAMP(6)`）。端到端用例里 Handler 用**另一条连接**读库，断言它看到的已是 `running`——直接证明 claim 事务先提交。失败策略本项**刻意最简**（还有次数立即回 pending、次数耗尽 dead），退避与永久错误分类留给 §4 |
 | [ ] | 多 Worker 并发领取 | MySQL `SKIP LOCKED` 集成测试证明并发无双重有效租约 | 待实现 |
 | [ ] | Worker graceful shutdown | 停止领取、通知运行 handler cancel、在超时内等待退出 | 待实现 |
+| [ ] | 持久化逐任务超时 | `Task.Timeout` 落库，领取后能还原该任务的 Handler 超时 | 2026-10-13 决定：**本项先用 Worker 默认 `HandlerTimeout`**。设计缺口——`Task.Timeout` 文档上写作「本次 Handler 超时」，但 DDL 里没有对应列，领取后就丢了，重启/重领无法还原。后续加迁移 `0002` 增一列（如 `timeout_us BIGINT NULL`），入队时持久化、`ClaimedTask` 带回 |
 
 ## 4. 租约、恢复与失败处理
 
