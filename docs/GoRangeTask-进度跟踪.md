@@ -68,7 +68,7 @@
 
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
-| [ ] | Handler 注册与 payload 解码 | task type 映射、未知类型处理、schema 错误路径明确 | 待实现 |
+| [x] | Handler 注册与 payload 解码 | task type 映射、未知类型处理、schema 错误路径明确 | 2026-10-12 提交 `e2c4147`：`Registry.Resolve` 对未注册类型返回带永久标记的 `ErrNoHandler`（task_type 是入队时定死的值，重试不会让它变得可处理 ⇒ 直接进 dead）；`TypedHandler[T]` 把 `json.Unmarshal` 收进库，解码失败返回带永久标记的 `ErrInvalidPayload`（覆盖"无法解码 payload 不能无限快速重试"），nil 函数构造期 panic；`Permanent`/`IsPermanent` 用私有类型打标记，nil 安全、可重复、`errors.Is`/`As` 仍可穿透。根包覆盖率 100% |
 | [ ] | 单 Worker claim/execute/ack | handler 在 claim 事务提交后运行；成功写回终态 | 待实现 |
 | [ ] | 多 Worker 并发领取 | MySQL `SKIP LOCKED` 集成测试证明并发无双重有效租约 | 待实现 |
 | [ ] | Worker graceful shutdown | 停止领取、通知运行 handler cancel、在超时内等待退出 | 待实现 |
