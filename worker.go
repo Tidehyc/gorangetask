@@ -1,0 +1,359 @@
+package gorangetask
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+)
+
+// ClaimedTask 是 Worker 成功领取到的一条任务，连同本次领取的 fencing 凭据。
+//
+// 它是执行侧的输入：Claim 返回它，随后 Succeed / Retry / MarkDead 用它把结果
+// 写回去。与 TaskInfo 的区别在于它面向 Worker 内部——带 Owner / Epoch 这两个
+// 只对执行者有意义的字段，因此不暴露给只做查询的调用方。
+type ClaimedTask struct {
+	// ID 是任务标识。
+	ID TaskID
+	// Queue 是任务所属队列。
+	Queue string
+	// Type 是任务类型名，用于映射 Handler。
+	Type string
+	// Payload 是任务的 JSON 参数。
+	Payload json.RawMessage
+	// Attempt 是**包含本次**在内的尝试次数（领取时由存储 +1）。
+	Attempt int
+	// MaxAttempts 是最大尝试次数。Attempt >= MaxAttempts 表示次数已耗尽。
+	MaxAttempts int
+
+	// Owner 是本次领取的持有者标识；Epoch 是本次领取的租约代数。
+	//
+	// 两者构成 fencing 凭据：写回时存储必须同时匹配 owner 与 epoch，
+	// 否则视为租约已易主，写回被拒绝（ErrLeaseLost）。这样即使一个已经
+	// 失去租约的旧 Worker 恢复过来，也无法覆盖新持有者的结果。
+	Owner string
+	Epoch uint64
+}
+
+// ClaimSpec 是一次领取请求。字段全部来自 Worker 配置，由 Worker 构造。
+type ClaimSpec struct {
+	// Queue 是本次领取的目标队列。
+	Queue string
+	// Limit 是本次最多领取的任务数，必须大于 0。
+	Limit int
+	// Owner 是本次领取的持有者标识，不能为空。
+	Owner string
+	// LeaseDuration 是本次领取的租约时长，必须大于 0。
+	LeaseDuration time.Duration
+}
+
+// WorkerStore 是 Worker 执行闭环所依赖的存储能力。
+//
+// 根包只通过这个接口做领取与确认，不直接书写 SQL；方言实现（如
+// store/mysql）负责把语义翻译成具体语句。所有方法都必须在 ctx 取消时尽快返回。
+//
+// 实现约定（技术设计 §5.2–§5.5）：
+//   - Claim 必须在**事务提交之后**才把任务交给调用方执行；Handler 绝不能在
+//     事务或行锁持有期间运行。
+//   - Claim 应当只领取 status='pending' 且 run_at 已到期的任务，并原子地把它们
+//     置为 running、递增 lease_epoch 与 attempt。
+//   - Succeed / Retry / MarkDead 必须校验 (id, status='running', owner, epoch,
+//     租约未过期) 这组条件；影响 0 行时返回 ErrLeaseLost，不得用无条件更新补救。
+type WorkerStore interface {
+	// Claim 原子领取一批到期任务。没有可领取的任务时返回空切片且 err 为 nil。
+	Claim(ctx context.Context, spec ClaimSpec) ([]ClaimedTask, error)
+
+	// Succeed 把任务写为 succeeded 终态、清空租约并设置 finished_at。
+	Succeed(ctx context.Context, task ClaimedTask) error
+
+	// Retry 把任务写回 pending，在 delay 之后可再次被领取，并记录错误摘要。
+	// delay 为 0 表示立即可重领。
+	Retry(ctx context.Context, task ClaimedTask, delay time.Duration, lastError string) error
+
+	// MarkDead 把任务写入死信终态（不再自动重试），并记录错误摘要。
+	MarkDead(ctx context.Context, task ClaimedTask, lastError string) error
+}
+
+// Worker 从队列领取任务、调用 Handler、再把结果写回存储。
+//
+// 使用方式：
+//
+//	w, err := gorangetask.NewWorker(store, registry, cfg)
+//	if err != nil { ... }
+//	go w.Run(ctx)          // ctx 取消即停止领取
+//
+// 本项（进度跟踪 §3「单 Worker claim/execute/ack」）已实现的语义：
+//   - 领取：一次 claim 周期内先提交事务，再执行 Handler，顺序有保证。
+//   - 并发：Run 按 Config.Concurrency 起同等数量的 goroutine，各自独立领取。
+//   - 成功：写回 succeeded 终态。
+//   - 失败：写回 pending 立即重试；若尝试次数已耗尽则写为 dead。
+//
+// 尚未实现的语义（后续工作项，文档已排期）：
+//   - **租约续期（§4）**：Handler 必须能在 LeaseDuration 内结束。超时后租约过期，
+//     本次写回会被 fencing 拒绝（ErrLeaseLost），任务要等回收器（§4）才能重领。
+//   - **租约丢失取消 context（§4）**：Handler 不会因失租被提前取消。
+//   - **回收器（§4）**：进程崩溃留下的 running 任务暂无人回收。
+//   - **指数退避与永久错误（§4）**：失败一律立即重试，不区分 Permanent，
+//     也不做退避；因此永久失败的任务会尝试到次数耗尽才进入 dead。
+//   - **panic 隔离（§4）**：Handler panic 会向上冒泡，尚未被单任务边界拦截。
+//   - **优雅停机（§3 最后一行）**：ctx 取消即刻停止领取，不等待在途 Handler。
+//   - **可观测性（§5）**：基础设施错误目前没有公开出口。
+type Worker struct {
+	store    WorkerStore
+	registry *Registry
+	cfg      Config
+	owner    string
+
+	// onError 接收与单个任务无关的基础设施错误（领取失败、写回失败等）。
+	// 目前没有公开的日志出口，这里是留给自己与测试的内部缝隙，默认丢弃；
+	// §5「结构化日志」会把它换成真正的日志句柄。
+	onError func(error)
+
+	// rr 用于在多个监听队列之间轮转，避免总是先打同一个队列。
+	rr atomic.Uint64
+}
+
+// NewWorker 构造一个 Worker。store 与 registry 不能为 nil，registry 至少要注册
+// 一个 Handler，cfg 会先经 WithDefaults 填充再校验。
+func NewWorker(store WorkerStore, registry *Registry, cfg Config) (*Worker, error) {
+	if store == nil {
+		return nil, fmt.Errorf("%w: nil worker store", ErrInvalidConfig)
+	}
+	if registry == nil {
+		return nil, fmt.Errorf("%w: nil handler registry", ErrInvalidConfig)
+	}
+	// 一个 Handler 都没注册的 Worker 只会把所有任务判成"类型未知"，
+	// 属于启动期就该发现的配置错误，不留给运行期。
+	if registry.Len() == 0 {
+		return nil, fmt.Errorf("%w: no handlers registered", ErrInvalidConfig)
+	}
+	cfg = cfg.WithDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &Worker{
+		store:    store,
+		registry: registry,
+		cfg:      cfg,
+		owner:    newOwnerID(),
+	}, nil
+}
+
+// Run 启动 Worker 并阻塞，直到 ctx 被取消。
+//
+// 它会启动 Config.Concurrency 个 goroutine，每个都反复执行
+// "领取一批 → 逐条执行 → 写回结果"。队列为空（或领取失败）时按
+// PollInterval 起、指数退避至 MaxPollInterval 并加抖动，避免空队列时的
+// 高频轮询；一旦领到任务就把退避重置回 PollInterval。
+//
+// 单个任务执行失败不会中断循环：失败会被写回存储（pending 重试或 dead）。
+// ctx 取消后 Run 返回 nil。
+func (w *Worker) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	for i := 0; i < w.cfg.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.loop(ctx)
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+// loop 是一个 goroutine 的领取循环。
+func (w *Worker) loop(ctx context.Context) {
+	backoff := w.cfg.PollInterval
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		claimed, err := w.runOnce(ctx)
+
+		// 被取消时立刻退出，不再为已领取的任务做无谓的写回尝试
+		// （那些任务会留给回收器，见 Worker 文档）。
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			w.report(err)
+			backoff = w.sleep(ctx, backoff)
+			continue
+		}
+		if claimed == 0 {
+			backoff = w.sleep(ctx, backoff)
+			continue
+		}
+		// 领到了任务说明有活干，退避重置。
+		backoff = w.cfg.PollInterval
+	}
+}
+
+// runOnce 从下一个队列领取一批任务并逐条处理，返回本次领取到的条数。
+//
+// 返回的 error 只表示"领取"本身失败（基础设施问题）；单条任务的执行失败
+// 会被写回存储，不作为 error 返回。
+func (w *Worker) runOnce(ctx context.Context) (int, error) {
+	claimed, err := w.store.Claim(ctx, ClaimSpec{
+		Queue:         w.pickQueue(),
+		Limit:         w.cfg.BatchSize,
+		Owner:         w.owner,
+		LeaseDuration: w.cfg.LeaseDuration,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("claim tasks: %w", err)
+	}
+
+	// 领取事务已经提交，此时任务在库里已是 running 且带着本次的 owner/epoch；
+	// 从这里开始执行 Handler 不会持有任何数据库事务或行锁。
+	for _, task := range claimed {
+		w.process(ctx, task)
+	}
+	return len(claimed), nil
+}
+
+// process 执行一条已领取的任务并写回结果。它不返回 error：任务的失败是
+// 预期内的结果，写回存储即可；写回本身失败才通过 report 上报。
+func (w *Worker) process(ctx context.Context, task ClaimedTask) {
+	if err := w.execute(ctx, task); err != nil {
+		w.fail(ctx, task, err)
+		return
+	}
+	if err := w.store.Succeed(ctx, task); err != nil {
+		// 写回失败通常是租约过期/易主（ErrLeaseLost）。按设计不做无条件更新补救，
+		// 任务的最终命运交给回收器。
+		w.report(fmt.Errorf("ack success for task %d: %w", task.ID, err))
+	}
+}
+
+// execute 解析 Handler 并在超时 context 下运行它。
+func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
+	handler, err := w.registry.Resolve(task.Type)
+	if err != nil {
+		return err
+	}
+	// 逐任务的 Handler 超时目前统一取 Worker 默认值：Task.Timeout 没有落库，
+	// 领取之后无法还原（见进度跟踪「持久化逐任务超时」待办）。
+	runCtx, cancel := context.WithTimeout(ctx, w.cfg.HandlerTimeout)
+	defer cancel()
+
+	return handler(runCtx, task.Payload)
+}
+
+// fail 把一次执行失败写回存储。本项的策略刻意最简：
+// 还有次数就立即回到 pending，次数耗尽就进 dead。
+func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error) {
+	summary := cause.Error()
+
+	// Attempt 是"包含本次"的尝试次数，因此 Attempt >= MaxAttempts 即已耗尽。
+	if task.Attempt >= task.MaxAttempts {
+		if err := w.store.MarkDead(ctx, task, summary); err != nil {
+			w.report(fmt.Errorf("mark task %d dead: %w", task.ID, err))
+		}
+		return
+	}
+
+	// delay 传 0：立即重试。指数退避与永久错误分类由 §4 补齐
+	// （技术设计 §5.5 已给出 full-jitter 公式）。
+	if err := w.store.Retry(ctx, task, 0, summary); err != nil {
+		w.report(fmt.Errorf("retry task %d: %w", task.ID, err))
+	}
+}
+
+// pickQueue 在监听队列之间轮转。只有一个队列时直接返回它。
+func (w *Worker) pickQueue() string {
+	queues := w.cfg.Queues
+	if len(queues) == 1 {
+		return queues[0]
+	}
+	n := w.rr.Add(1) - 1
+	return queues[n%uint64(len(queues))]
+}
+
+// sleep 睡一段带抖动的退避时间，并返回下一轮更大的退避值（封顶 MaxPollInterval）。
+func (w *Worker) sleep(ctx context.Context, backoff time.Duration) time.Duration {
+	d := backoff
+	if d < w.cfg.PollInterval {
+		d = w.cfg.PollInterval
+	}
+	next := d * 2
+	if next > w.cfg.MaxPollInterval {
+		next = w.cfg.MaxPollInterval
+	}
+	_ = sleepContext(ctx, jitter(d))
+	return next
+}
+
+// report 上报一个与单个任务无关的基础设施错误。
+func (w *Worker) report(err error) {
+	if w.onError != nil {
+		w.onError(err)
+	}
+}
+
+// sleepContext 睡 d，ctx 取消则提前返回。d <= 0 时立即返回。
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// jitter 返回 [d/2, d] 之间的一个随机时长：空队列轮询时让多个 Worker 错开，
+// 避免它们在同一时刻一起醒来抢锁。
+func jitter(d time.Duration) time.Duration {
+	if d <= 1 {
+		return d
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+// newOwnerID 生成一个在集群内足够唯一的租约持有者标识。
+//
+// 形如 host-pid-16hex：主机名 + 进程号 + 随机数，既能一眼看出是哪个进程，
+// 也能保证同一台机器上重启后的新进程不会与旧进程撞名。
+func newOwnerID() string {
+	// 拿不到主机名时 os.Hostname 返回空串，由 ownerID 回退到 "worker"，
+	// 因此这里不必单独分支处理错误。
+	host, _ := os.Hostname()
+	return ownerID(host, os.Getpid(), rand.Uint64())
+}
+
+// ownerID 把持有者标识的各个部分拼成一个字符串。
+//
+// lease_owner 的列宽由方言决定（MySQL 为 VARCHAR(128)）。这里把主机名截到
+// 64 字符，整串最长 64+1+7+1+16 = 89 字符，给列宽留足余量。
+func ownerID(host string, pid int, nonce uint64) string {
+	if host == "" {
+		host = "worker"
+	}
+	host = truncateRunes(host, 64)
+
+	return fmt.Sprintf("%s-%d-%016x", host, pid, nonce)
+}
+
+// truncateRunes 按字符（而非字节）截断 s 到最多 n 个字符。
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
