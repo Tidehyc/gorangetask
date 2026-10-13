@@ -54,6 +54,7 @@ CREATE TABLE gotask_tasks (
     created_at        DATETIME(6) NOT NULL,
     updated_at        DATETIME(6) NOT NULL,
     finished_at       DATETIME(6) NULL,
+    timeout_ns        BIGINT UNSIGNED NULL,   -- 0002 追加：逐任务 Handler 超时（纳秒）
     PRIMARY KEY (id),
     UNIQUE KEY uq_gotask_queue_idempotency (queue_name, idempotency_key),
     KEY ix_gotask_claim (queue_name, status, run_at, id),
@@ -72,6 +73,7 @@ CREATE TABLE gotask_tasks (
 - 可选 `idempotency_key` 在任务记录保留期间由唯一索引约束。清理终态任务后，该 key 可能再次被接受；API 文档须明确该作用域。
 - 成功任务默认保留 7 天，死信默认保留 30 天；值可配置。首版 cleanup 批量删除终态任务，不删除 `pending` / `running`。
 - 任务 payload 默认上限 256 KiB；不存文件、视频或其他大对象，只存引用 ID。
+- `timeout_ns` 为可选的逐任务 Handler 超时，`NULL` 表示未设置（用 Worker 配置的默认值）。单位取纳秒而不是微秒：`time.Duration` 本身就是纳秒计数，按微秒存会把不足 1µs 的超时截断成 0，读取方就会把它误当成"未设置"。该列由 0002 追加在表末——MySQL 8.0.12+ 只在"加为最后一列"时支持 `ALGORITHM=INSTANT`，插在中间会退化成重建整表。
 
 ### 3.2 数据库时间
 
@@ -103,9 +105,9 @@ CREATE TABLE gotask_tasks (
 ```sql
 INSERT INTO gotask_tasks (
     queue_name, task_type, payload, status, run_at,
-    attempt, max_attempts, lease_epoch, idempotency_key,
+    attempt, max_attempts, lease_epoch, idempotency_key, timeout_ns,
     created_at, updated_at
-) VALUES (?, ?, CAST(? AS JSON), 'pending', ?, 0, ?, 0, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6));
+) VALUES (?, ?, CAST(? AS JSON), 'pending', ?, 0, ?, 0, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6));
 ```
 
 幂等冲突首版返回稳定的 `ErrDuplicateTask`，不静默覆盖旧任务，也不自动返回旧 ID。业务方需要旧 ID 时可根据 `(queue_name, idempotency_key)` 查询。
@@ -276,7 +278,7 @@ type ClientConfig struct {
 
 `Task.Timeout` 为逐任务超时（对应需求文档 §7 草案与 §4.2「Handler 执行超时可配置」）：零值表示使用 Worker 级默认 Handler 超时；非零值覆盖本次执行的 Handler 超时。该超时通过传给 Handler 的 `context.Context` 的 deadline 实现，与租约、shutdown 的取消是同一套协作式取消机制。
 
-> **已知缺口（2026-10-13）**：`Task.Timeout` 目前没有对应的数据库列，任务一旦被领取就无法还原它，因此第一个实现只使用 Worker 级默认超时——逐任务超时实际不生效。补一列持久化该值已列入[进度跟踪](./GoRangeTask-进度跟踪.md)（§3「持久化逐任务超时」）。
+> **已落库（2026-10-13）**：迁移 0002 增加了 `timeout_ns` 列，`Task.Timeout` 入队时持久化、`ClaimedTask` 领取时还原（`NULL` → 0 → 用 Worker 默认值），逐任务超时已实际生效。早先"没有对应列、只使用 Worker 默认超时"的缺口已消除。
 
 API 约定：
 
