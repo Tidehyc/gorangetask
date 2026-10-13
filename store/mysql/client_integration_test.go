@@ -261,10 +261,14 @@ func TestEnqueueWritesPendingTask(t *testing.T) {
 func TestEnqueueDelayedTaskStoresRunAtInUTC(t *testing.T) {
 	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
 
+	// run_at 必须相对**数据库时钟**构造。写死一个绝对时刻的用例会随时间推移
+	// 从"未来"变成"过去"，于是它从"延迟任务"悄悄退化成"已到期任务"——
+	// 这个断言确实因为日期流逝失败过一次。
 	shanghai := time.FixedZone("CST", 8*3600)
-	// 北京时间 2026-10-12 20:30:45.123456789 → UTC 12:30:45.123456
-	runAt := time.Date(2026, 10, 12, 20, 30, 45, 123456789, shanghai)
-	wantUTC := time.Date(2026, 10, 12, 12, 30, 45, 123456000, time.UTC)
+	// 带时区、且带非零纳秒：前者验证"传入 +08:00 的时刻按等价 UTC instant 存储"，
+	// 后者验证 DATETIME(6) 把纳秒截断到微秒。
+	runAt := dbNow(t, db).Add(2 * time.Hour).In(shanghai).Add(123456789 * time.Nanosecond)
+	wantUTC := runAt.UTC().Truncate(time.Microsecond)
 
 	id, err := c.Enqueue(context.Background(), gorangetask.Task{
 		Type:    "send_email",
