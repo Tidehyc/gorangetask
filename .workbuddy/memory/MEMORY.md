@@ -28,12 +28,18 @@
   导入该包会顺带注册 go-sql-driver，调用方无需再 import 驱动。
   **已完整实现根包 `Client` 接口**（Enqueue / EnqueueTx / Get / Cancel），
   并有编译期断言 `var _ gorangetask.Client = (*Client)(nil)`。
-  Worker 侧的领取/续租/确认/回收 SQL 尚未实现。
+  **同时实现根包 `WorkerStore`**（Claim / Succeed / Retry / MarkDead，
+  `store/mysql/worker.go`，有第二个编译期断言）。租约续期、回收器、清理还没做。
 - `migrations/mysql`（package `mysqlmigrations`）：**独立包，不并入 store**。
   理由：`//go:embed` 不能跨目录向上取文件；迁移是「建表」的完整闭环且已有独立测试。
   调用顺序是「先 `mysqlmigrations.Migrate`，再 `mysqlstore.New`」。
 - `config.go` 里 **`Config`（Worker 运行配置）与 `ClientConfig`（入队侧配置）刻意分开**：
   只想入队的进程不必构造 16 个 Worker 字段。
+- 根包 `worker.go`（2026-10-13）：导出 `WorkerStore` 接口 + `ClaimSpec` + `ClaimedTask`
+  + `Worker`（`NewWorker`/`Run`）。**根包只依赖接口、不写 SQL**；SQL 在
+  `store/mysql/worker.go`。两个包各有一个同名小工具 `truncateRunes`（互不影响）。
+  `ClaimedTask` 除任务数据外还带 `Owner`+`Epoch`——它们就是 fencing 凭据，
+  三条写回 SQL 靠 `(id, status='running', owner, epoch, lease_until 未过期)` 卡住旧持有者。
 
 ## 测试约定
 
@@ -53,6 +59,9 @@
   `export TMPDIR=/home/tide/.cache/go-tmp GOTMPDIR=/home/tide/.cache/go-tmp`，
   否则 `no space left on device`。
 - 时间断言一律以**数据库时钟**为准（`SELECT UTC_TIMESTAMP(6)`），不用测试机时钟。
+- **不要把"未来/过去"的时刻写死进测试数据**：写死一个绝对未来时刻的用例，过了那天
+  就会静默退化成"已到期"用例并报出假失败（2026-10-13 真的踩过一次，
+  见 `TestEnqueueDelayedTaskStoresRunAtInUTC`）。一律用 `dbNow(t, db).Add(...)` 构造。
 - 仓库内不要建临时目录实验：沙箱的 `rm` 是 safe-delete 垫片，会把文件挪进
   `.Trash-0/` 污染 `git status` 与 `gofmt -l`。用 `/bin/rm`，或把实验放到仓库外
   （如 `/home/tide/.cache/`）。`.gitignore` 已加 `.Trash-*/` 兜底。
@@ -63,6 +72,14 @@
 - 容器 `gotask-mysql`（mysql:8.0，卷 `gotask-mysql-data`，`127.0.0.1:3306`，UTC，
   READ-COMMITTED），用 `scripts/dev-mysql.sh up|down|reset|status|shell` 管理。
   宿主机没有 mysql-server，环境不被污染。
+- **容器可能被用户停掉**（`docker ps` 显示 `Exited`）。跑集成测试前先
+  `./scripts/dev-mysql.sh status`；停了就先 `up`（容器已存在时会直接启动并等就绪）。
+  **不要自己在宿主机上另起 mysqld**：Ubuntu 的 AppArmor 用
+  `/etc/apparmor.d/usr.sbin.mysqld` 把 mysqld 限制在 `/var/lib/mysql/**` 等路径，
+  datadir 放别处直接 EACCES/EPERM。真需要绕过时，AppArmor 按**可执行文件路径**匹配，
+  把 mysqld 复制到别的路径再跑可绕开 profile（复制可行、跨设备硬链接不行；
+  本机 `/var/lib/mysql` 不存在）。这条只验证到 `--initialize-insecure` 成功，
+  未验证启动服务，属备用方案。
 - 库：`gotask`（开发）、`gotask_test`（迁移集成测试）、`gotask_test_store`（store 集成测试，
   自动创建）、`demo_business`/`gotask_test_business`（事务入队测试的业务表，用完即删）。
 
@@ -72,7 +89,9 @@
 - 唯一索引 `uq_gotask_queue_idempotency (queue_name, idempotency_key)`：
   **NULL 不参与唯一性判断** ⇒ 空幂等键必须写 NULL，写空串会被误判为重复。
 - 时间列一律 UTC；参与时序判断的值以数据库为准（SQL 里用 `UTC_TIMESTAMP(6)`）。
-- 领取用 `FOR UPDATE SKIP LOCKED`（尚未实现）。
+- 领取用 `FOR UPDATE SKIP LOCKED`，且**加锁读只取 `id`**：取 payload 会让查询
+  离开覆盖索引 `ix_gotask_claim`，加锁代价随行宽放大。完整行在 **claim 事务提交后**
+  按主键回读（因此 Handler 绝不在事务/行锁内运行）。`lease_epoch` 每次领取 +1。
 
 ## 错误模型（2026-10-13 定）
 
