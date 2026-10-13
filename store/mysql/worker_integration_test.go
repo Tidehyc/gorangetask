@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -933,6 +934,351 @@ func TestWorkerRunMarksDeadWhenAttemptsExhausted(t *testing.T) {
 	}
 	if !row.finishedAt.Valid {
 		t.Error("finished_at is NULL; dead is terminal")
+	}
+}
+
+// --- 多 Worker 并发领取 -----------------------------------------------------
+
+// leaseState 是一条任务在库里的租约状态，用来断言"只被领取过一次"。
+type leaseState struct {
+	epoch   int64
+	attempt int64
+	status  string
+	owner   sql.NullString
+}
+
+func readLeaseStates(t *testing.T, db *sql.DB, queue string) map[int64]leaseState {
+	t.Helper()
+
+	rows, err := db.QueryContext(context.Background(),
+		"SELECT id, lease_epoch, attempt, status, lease_owner FROM "+tasksTable+" WHERE queue_name = ?", queue)
+	if err != nil {
+		t.Fatalf("read lease states: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[int64]leaseState)
+	for rows.Next() {
+		var (
+			id int64
+			s  leaseState
+		)
+		if err := rows.Scan(&id, &s.epoch, &s.attempt, &s.status, &s.owner); err != nil {
+			t.Fatalf("scan lease state: %v", err)
+		}
+		out[id] = s
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate lease states: %v", err)
+	}
+	return out
+}
+
+// TestConcurrentClaimNeverDoubleClaims 是本项的核心证据：多个领取者同时抢同一批
+// 任务时，**每条任务只能被领走一次**。
+//
+// 断言分两层：
+//   - 进程侧：所有领取者拿到的 task id 两两不重复，且合起来恰好覆盖全部任务；
+//   - 数据库侧：每条任务的 lease_epoch 与 attempt 都还是 1 —— epoch 每次领取 +1，
+//     所以 1 就等于"只被领取过一次"。第二层不依赖进程侧的记录，即使进程侧代码
+//     写错了也抓得住。
+//
+// 领取者故意用不同的 Limit（1..5），顺带覆盖"一次领一批"的路径：
+// 批量领取在一个事务里逐条 UPDATE，是并发下最容易出问题的地方。
+func TestConcurrentClaimNeverDoubleClaims(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue      = "q-concurrent-claim"
+		taskCount  = 40
+		claimerNum = 8
+	)
+
+	want := make(map[gorangetask.TaskID]bool, taskCount)
+	for i := 0; i < taskCount; i++ {
+		id, err := c.Enqueue(ctx, gorangetask.Task{
+			Queue:   queue,
+			Type:    "t",
+			Payload: json.RawMessage(`{}`),
+		})
+		if err != nil {
+			t.Fatalf("Enqueue #%d: %v", i, err)
+		}
+		want[id] = true
+	}
+
+	start := make(chan struct{})
+	var (
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		claimedBy  = make(map[gorangetask.TaskID]string, taskCount)
+		violations []string
+	)
+
+	for i := 0; i < claimerNum; i++ {
+		owner := fmt.Sprintf("worker-%d", i)
+		limit := 1 + i%5
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // 所有领取者尽量在同一时刻出发，把竞争窗口放到最大
+
+			for {
+				got, err := c.Claim(ctx, gorangetask.ClaimSpec{
+					Queue:         queue,
+					Limit:         limit,
+					Owner:         owner,
+					LeaseDuration: time.Minute, // 租约远长于用例时长，排除"租约过期被重领"
+				})
+				if err != nil {
+					// 并发领取不该报错：SKIP LOCKED 不等待，因此不存在死锁(1213)。
+					mu.Lock()
+					violations = append(violations, fmt.Sprintf("%s: Claim failed: %v", owner, err))
+					mu.Unlock()
+					return
+				}
+				if len(got) == 0 {
+					return
+				}
+
+				mu.Lock()
+				for _, task := range got {
+					if prev, exists := claimedBy[task.ID]; exists {
+						violations = append(violations,
+							fmt.Sprintf("task %d claimed twice: %s and %s", task.ID, prev, owner))
+					}
+					claimedBy[task.ID] = owner
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(violations) > 0 {
+		t.Fatalf("concurrent claim violations:\n  %s", strings.Join(violations, "\n  "))
+	}
+	if len(claimedBy) != taskCount {
+		t.Errorf("claimed %d distinct tasks, want %d", len(claimedBy), taskCount)
+	}
+	for id := range want {
+		if _, ok := claimedBy[id]; !ok {
+			t.Errorf("task %d was never claimed (任务丢失)", id)
+		}
+	}
+
+	// 记录领取的分布：确认任务确实被多个领取者分散拿走，而不是被一个包圆
+	// （用日志而非断言，避免依赖 goroutine 调度的时序而变成 flaky）。
+	perOwner := make(map[string]int, claimerNum)
+	for _, owner := range claimedBy {
+		perOwner[owner]++
+	}
+	t.Logf("claim distribution (owners=%d): %v", len(perOwner), perOwner)
+
+	// 数据库侧的独立复核：epoch/attempt 仍是 1 ⇒ 每条只被领取过一次。
+	states := readLeaseStates(t, db, queue)
+	if len(states) != taskCount {
+		t.Fatalf("read %d task rows, want %d", len(states), taskCount)
+	}
+	for id, state := range states {
+		if state.epoch != 1 {
+			t.Errorf("task %d lease_epoch = %d, want 1 (被领取了不止一次)", id, state.epoch)
+		}
+		if state.attempt != 1 {
+			t.Errorf("task %d attempt = %d, want 1", id, state.attempt)
+		}
+		if state.status != string(gorangetask.StatusRunning) {
+			t.Errorf("task %d status = %q, want running", id, state.status)
+		}
+		if !state.owner.Valid {
+			t.Errorf("task %d has no lease owner", id)
+		}
+	}
+}
+
+// TestClaimSkipsRowsLockedByAnotherSession 直接验证 SKIP LOCKED 的语义：
+// 另一会话持有某行锁时，Claim 必须**跳过它**拿走其余任务，而不是阻塞等待。
+// 这条性质是多 Worker 能并行领取的前提——没有它，抢占就退化成一串串行等待。
+func TestClaimSkipsRowsLockedByAnotherSession(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const queue = "q-skip-locked"
+	ids := make([]gorangetask.TaskID, 0, 3)
+	for i := 0; i < 3; i++ {
+		id, err := c.Enqueue(ctx, gorangetask.Task{Queue: queue, Type: "t", Payload: json.RawMessage(`{}`)})
+		if err != nil {
+			t.Fatalf("Enqueue #%d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+
+	// 在另一条连接上锁住"本该第一个被领走"的那行。这里刻意用普通 FOR UPDATE
+	// （不带 SKIP LOCKED），所以它是真的把锁握住了。
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin locking transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var lockedID int64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT id FROM "+tasksTable+
+			" WHERE queue_name = ? AND status = 'pending' ORDER BY run_at, id LIMIT 1 FOR UPDATE",
+		queue).Scan(&lockedID); err != nil {
+		t.Fatalf("lock first claimable row: %v", err)
+	}
+
+	claimCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	tasks, err := c.Claim(claimCtx, gorangetask.ClaimSpec{
+		Queue: queue, Limit: 3, Owner: "w", LeaseDuration: time.Minute,
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Claim failed (被锁的行不该让它阻塞或报错): %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Claim took %s; SKIP LOCKED should not wait for the locked row", elapsed)
+	}
+
+	// 只该拿到未锁定的两条。
+	got := make(map[gorangetask.TaskID]bool, len(tasks))
+	for _, task := range tasks {
+		got[task.ID] = true
+	}
+	if len(tasks) != len(ids)-1 {
+		t.Errorf("claimed %d tasks, want %d (被锁的行必须被跳过)", len(tasks), len(ids)-1)
+	}
+	if got[gorangetask.TaskID(lockedID)] {
+		t.Errorf("claimed the locked task %d; SKIP LOCKED must skip it", lockedID)
+	}
+	for _, id := range ids {
+		if int64(id) == lockedID {
+			continue
+		}
+		if !got[id] {
+			t.Errorf("task %d was not claimed, want it in the batch", id)
+		}
+	}
+
+	// 锁一释放，那条又可被领取 ⇒ 之前不是"领不到"，只是"被跳过"。
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	rest := claimOnce(t, c, queue, "w2")
+	if int64(rest.ID) != lockedID {
+		t.Errorf("after the lock is released, claimed %d, want the previously locked %d", rest.ID, lockedID)
+	}
+}
+
+// TestMultipleWorkersProcessEachTaskExactlyOnce 把并发领取放到 Worker 层面验证：
+// 多个 Worker 实例同时跑，每条任务必须**恰好被执行一次**。若两个 Worker 能同时
+// 持有同一条任务的有效租约，这里的计数就会大于 1。
+func TestMultipleWorkersProcessEachTaskExactlyOnce(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue     = "q-multi-worker"
+		workerNum = 4
+		taskCount = 24
+		taskType  = "multi.task"
+		maxWait   = 30 * time.Second
+	)
+
+	for i := 0; i < taskCount; i++ {
+		if _, err := c.Enqueue(ctx, gorangetask.Task{
+			Queue:   queue,
+			Type:    taskType,
+			Payload: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i)),
+		}); err != nil {
+			t.Fatalf("Enqueue #%d: %v", i, err)
+		}
+	}
+
+	// counts[n] 记录第 n 条任务被 Handler 执行了几次。
+	var counts sync.Map
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, taskType, func(_ context.Context, payload json.RawMessage) error {
+		var in struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(payload, &in); err != nil {
+			return err
+		}
+		counter, _ := counts.LoadOrStore(in.N, new(atomic.Int32))
+		counter.(*atomic.Int32).Add(1)
+		return nil
+	})
+
+	// 每个 Worker 自己再开 2 个并发协程，让同时竞争领取的协程数达到 8。
+	cfg := workerConfig(queue)
+	cfg.Concurrency = 2
+
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	runErrs := make(chan error, workerNum)
+
+	for i := 0; i < workerNum; i++ {
+		w, err := gorangetask.NewWorker(c, reg, cfg)
+		if err != nil {
+			t.Fatalf("NewWorker #%d: %v", i, err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runErrs <- w.Run(runCtx)
+		}()
+	}
+
+	waitForSucceededCount(t, db, queue, taskCount, maxWait)
+	cancel()
+	wg.Wait()
+	close(runErrs)
+
+	for err := range runErrs {
+		if err != nil {
+			t.Errorf("Run() = %v, want nil", err)
+		}
+	}
+
+	for i := 0; i < taskCount; i++ {
+		value, ok := counts.Load(i)
+		if !ok {
+			t.Errorf("task #%d was never handled", i)
+			continue
+		}
+		if got := value.(*atomic.Int32).Load(); got != 1 {
+			t.Errorf("task #%d handled %d times, want exactly 1 (并发下不得双重持有租约)", i, got)
+		}
+	}
+}
+
+// waitForSucceededCount 等到队列里进入 succeeded 的任务数达到 want。
+func waitForSucceededCount(t *testing.T, db *sql.DB, queue string, want int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		var got int
+		if err := db.QueryRowContext(context.Background(),
+			"SELECT COUNT(*) FROM "+tasksTable+" WHERE queue_name = ? AND status = 'succeeded'",
+			queue).Scan(&got); err != nil {
+			t.Fatalf("count succeeded tasks: %v", err)
+		}
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d tasks succeeded after %s", got, want, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
