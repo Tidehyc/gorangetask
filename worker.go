@@ -16,7 +16,8 @@ import (
 //
 // 它是执行侧的输入：Claim 返回它，随后 Succeed / Retry / MarkDead 用它把结果
 // 写回去。与 TaskInfo 的区别在于它面向 Worker 内部——带 Owner / Epoch 这两个
-// 只对执行者有意义的字段，因此不暴露给只做查询的调用方。
+// 只对执行者有意义的 fencing 凭据（TaskInfo 刻意不含它们），因此不暴露给只做
+// 查询的调用方。
 type ClaimedTask struct {
 	// ID 是任务标识。
 	ID TaskID
@@ -30,6 +31,9 @@ type ClaimedTask struct {
 	Attempt int
 	// MaxAttempts 是最大尝试次数。Attempt >= MaxAttempts 表示次数已耗尽。
 	MaxAttempts int
+	// Timeout 是入队时指定的 Handler 超时；未设置时为 0，表示本次执行使用
+	// Worker 配置的 HandlerTimeout。
+	Timeout time.Duration
 
 	// Owner 是本次领取的持有者标识；Epoch 是本次领取的租约代数。
 	//
@@ -309,14 +313,21 @@ func (w *Worker) ack(ctx context.Context, task ClaimedTask) {
 }
 
 // execute 解析 Handler 并在超时 context 下运行它。
+//
+// 超时取 task.Timeout（入队时持久化、领取时还原）；为 0 表示没设置，
+// 回落到 Worker 配置的 HandlerTimeout。runCtx 派生自 ctx，因此停机取消
+// 仍然能传到 Handler 手里——两者是同一套协作式取消，谁先到期谁生效。
 func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
 	handler, err := w.registry.Resolve(task.Type)
 	if err != nil {
 		return err
 	}
-	// 逐任务的 Handler 超时目前统一取 Worker 默认值：Task.Timeout 没有落库，
-	// 领取之后无法还原（见进度跟踪「持久化逐任务超时」待办）。
-	runCtx, cancel := context.WithTimeout(ctx, w.cfg.HandlerTimeout)
+
+	timeout := task.Timeout
+	if timeout <= 0 {
+		timeout = w.cfg.HandlerTimeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	return handler(runCtx, task.Payload)

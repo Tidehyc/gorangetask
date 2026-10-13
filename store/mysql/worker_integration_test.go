@@ -1282,6 +1282,63 @@ func waitForSucceededCount(t *testing.T, db *sql.DB, queue string, want int, tim
 	}
 }
 
+// TestClaimRestoresPerTaskTimeout 固定"领取后能还原逐任务超时"：入队时设置的超时
+// 必须随 Claim 回到 Worker 手里。这条不能省——超时只存在于任务行上，进程重启或
+// 任务被重新领取之后，除了从行里读回来别无他法；读不回来就只剩 Worker 的默认值，
+// 长任务和短任务会被一视同仁地对待。没设置的任务回到 0，表示"用默认值"。
+func TestClaimRestoresPerTaskTimeout(t *testing.T) {
+	c, _ := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue = "q-claim-timeout"
+		want  = 12 * time.Second
+	)
+
+	withTimeout, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   queue,
+		Type:    "slow.task",
+		Payload: json.RawMessage(`{}`),
+		Timeout: want,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue(with timeout): %v", err)
+	}
+	withoutTimeout, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   queue,
+		Type:    "slow.task",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue(without timeout): %v", err)
+	}
+
+	claimed, err := c.Claim(ctx, gorangetask.ClaimSpec{
+		Queue:         queue,
+		Limit:         2,
+		Owner:         "claim-timeout-owner",
+		LeaseDuration: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("Claim returned %d tasks, want 2", len(claimed))
+	}
+
+	byID := make(map[gorangetask.TaskID]gorangetask.ClaimedTask, len(claimed))
+	for _, task := range claimed {
+		byID[task.ID] = task
+	}
+
+	if got := byID[withTimeout].Timeout; got != want {
+		t.Errorf("claimed timeout = %s, want %s (逐任务超时必须随 Claim 还原)", got, want)
+	}
+	if got := byID[withoutTimeout].Timeout; got != 0 {
+		t.Errorf("claimed timeout = %s, want 0 for a task without a timeout", got)
+	}
+}
+
 // --- 优雅停机 ---------------------------------------------------------------
 
 // TestShutdownLeavesCancelledTaskRunningForTheReaper 把"停机不提前释放租约"钉在

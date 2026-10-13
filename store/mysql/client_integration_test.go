@@ -418,6 +418,7 @@ func TestEnqueueRejectsInvalidTaskBeforeTouchingDatabase(t *testing.T) {
 		{"empty payload", gorangetask.Task{Type: "noop"}, gorangetask.ErrInvalidPayload},
 		{"invalid json", gorangetask.Task{Type: "noop", Payload: []byte(`{`)}, gorangetask.ErrInvalidPayload},
 		{"empty type", gorangetask.Task{Payload: []byte(`{}`)}, gorangetask.ErrInvalidTask},
+		{"negative timeout", gorangetask.Task{Type: "noop", Payload: []byte(`{}`), Timeout: -time.Second}, gorangetask.ErrInvalidTask},
 	}
 
 	for _, tc := range tests {
@@ -677,5 +678,71 @@ func TestEnqueueTxUsesCallerConnection(t *testing.T) {
 	// 事务外不可见。
 	if n := countTasks(t, db); n != 0 {
 		t.Errorf("visible outside tx = %d, want 0", n)
+	}
+}
+
+// TestEnqueuePersistsAndReturnsTaskTimeout 固定逐任务超时真的落库：
+//   - 设置过 → 库里 timeout_ns 是纳秒数，Get 能原样读回；
+//   - 没设置 → 库里是 **NULL**（不是 0），Get 读回 0。
+//
+// 区分 NULL 与 0 是这条用例的重点：读取方把 0 解释为"未设置"，
+// 若把"没填"写成 0，之后就无法区分两者的来源了。
+func TestEnqueuePersistsAndReturnsTaskTimeout(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const want = 90 * time.Second
+	withTimeout, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   "q-timeout",
+		Type:    "slow.task",
+		Payload: json.RawMessage(`{}`),
+		Timeout: want,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue(with timeout): %v", err)
+	}
+	withoutTimeout, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   "q-timeout",
+		Type:    "slow.task",
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue(without timeout): %v", err)
+	}
+
+	// 库侧直查，确认写进去的确实是指定的纳秒数 / NULL。
+	var (
+		storedWith    sql.NullInt64
+		storedWithout sql.NullInt64
+	)
+	if err := db.QueryRowContext(ctx,
+		"SELECT timeout_ns FROM "+tasksTable+" WHERE id = ?", int64(withTimeout)).Scan(&storedWith); err != nil {
+		t.Fatalf("read stored timeout: %v", err)
+	}
+	if !storedWith.Valid || storedWith.Int64 != int64(want) {
+		t.Errorf("stored timeout_ns = %v, want %d", storedWith, int64(want))
+	}
+	if err := db.QueryRowContext(ctx,
+		"SELECT timeout_ns FROM "+tasksTable+" WHERE id = ?", int64(withoutTimeout)).Scan(&storedWithout); err != nil {
+		t.Fatalf("read stored timeout: %v", err)
+	}
+	if storedWithout.Valid {
+		t.Errorf("stored timeout_ns = %d, want NULL when the task sets no timeout", storedWithout.Int64)
+	}
+
+	// Get 往返：设置过的原样读回，未设置的读回 0（即"用 Worker 默认值"）。
+	info, err := c.Get(ctx, withTimeout)
+	if err != nil {
+		t.Fatalf("Get(with timeout): %v", err)
+	}
+	if info.Timeout != want {
+		t.Errorf("Get().Timeout = %s, want %s", info.Timeout, want)
+	}
+	info, err = c.Get(ctx, withoutTimeout)
+	if err != nil {
+		t.Fatalf("Get(without timeout): %v", err)
+	}
+	if info.Timeout != 0 {
+		t.Errorf("Get().Timeout = %s, want 0 for a task without a timeout", info.Timeout)
 	}
 }

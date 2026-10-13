@@ -56,18 +56,19 @@ const (
 )
 
 // insertTaskSQL 插入一条 pending 任务，参数依次为：
-// queue_name、task_type、payload、run_at、max_attempts、idempotency_key。
+// queue_name、task_type、payload、run_at、max_attempts、idempotency_key、timeout_ns。
 //
 // run_at 用 COALESCE(?, UTC_TIMESTAMP(6))：传 NULL 表示"立即执行"，
 // 由数据库时间决定，避免依赖应用机器的时钟（技术设计 §3.2）。
+// timeout_ns 传 NULL 表示"未设置逐任务超时"，由 Worker 回落到配置的默认值。
 // status / attempt / lease_epoch / created_at / updated_at 都是新任务的
 // 固定初值，硬编码在 SQL 里，不给调用方留出错空间。
 const insertTaskSQL = `INSERT INTO ` + tasksTable + ` (
     queue_name, task_type, payload, status, run_at,
-    attempt, max_attempts, lease_epoch, idempotency_key,
+    attempt, max_attempts, lease_epoch, idempotency_key, timeout_ns,
     created_at, updated_at
 ) VALUES (?, ?, CAST(? AS JSON), 'pending', COALESCE(?, UTC_TIMESTAMP(6)),
-    0, ?, 0, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`
+    0, ?, 0, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`
 
 // execer 是 insert 需要的最小执行能力。*sql.DB 与 *sql.Tx 都满足它，
 // 因此 Enqueue（库自己取连接）与 EnqueueTx（复用调用方事务）可以共用同一段代码。
@@ -134,7 +135,8 @@ func (c *Client) insert(ctx context.Context, q execer, task gorangetask.Task) (g
 	}
 
 	res, err := q.ExecContext(ctx, insertTaskSQL,
-		p.queue, p.taskType, []byte(p.payload), p.runAt, p.maxAttempts, p.idempotencyKey)
+		p.queue, p.taskType, []byte(p.payload), p.runAt, p.maxAttempts,
+		p.idempotencyKey, p.timeoutNs)
 	if err != nil {
 		if isDuplicateEntry(err) {
 			return 0, fmt.Errorf("%w: queue %q already has a task with idempotency key %q",
@@ -160,6 +162,7 @@ type preparedTask struct {
 	runAt          any // nil 表示立即执行，交由 SQL 用 UTC_TIMESTAMP(6) 填
 	maxAttempts    int
 	idempotencyKey any // nil 表示无幂等键，必须是 NULL 而不是空串（见下）
+	timeoutNs      any // nil 表示未设置逐任务超时，由 Worker 回落默认值
 }
 
 // prepare 校验任务定义并归一化缺省值。所有失败都返回可用 errors.Is 判断的错误。
@@ -217,6 +220,17 @@ func (c *Client) prepare(task gorangetask.Task) (preparedTask, error) {
 		p.maxAttempts = task.MaxAttempts
 	}
 
+	// —— timeout_ns：零值落 NULL（按文档即"未设置，用 Worker 默认"），负值拒绝 ——
+	// 存 NULL 而不是 0：读取方把 0 解释为"未设置"，所以 0 本来就没有独立语义，
+	// 两者共用 NULL 这一种表示即可。纳秒口径下 time.Duration 不会被截断。
+	if task.Timeout < 0 {
+		return preparedTask{}, fmt.Errorf("%w: timeout must not be negative, got %s",
+			gorangetask.ErrInvalidTask, task.Timeout)
+	}
+	if task.Timeout > 0 {
+		p.timeoutNs = int64(task.Timeout)
+	}
+
 	// —— idempotency_key：空串必须落成 NULL ——
 	// 唯一索引是 (queue_name, idempotency_key)。MySQL 的唯一索引不约束 NULL，
 	// 但会把空串当成一个真实取值：若把 "" 写进去，同一队列的第二条无幂等键
@@ -248,7 +262,7 @@ func isDuplicateEntry(err error) bool {
 // lease_owner / lease_until / lease_epoch 属于 Worker 内部状态，不进 TaskInfo。
 const selectTaskSQL = `SELECT
     queue_name, task_type, payload, status, run_at,
-    attempt, max_attempts, idempotency_key, last_error,
+    attempt, max_attempts, timeout_ns, idempotency_key, last_error,
     created_at, updated_at, finished_at
 FROM ` + tasksTable + ` WHERE id = ?`
 
@@ -275,13 +289,14 @@ func (c *Client) Get(ctx context.Context, id gorangetask.TaskID) (gorangetask.Ta
 		queue, taskType, status     string
 		payload                     []byte
 		runAt, createdAt, updatedAt time.Time
+		timeoutNs                   sql.NullInt64
 		idempotencyKey, lastError   sql.NullString
 		finishedAt                  sql.NullTime
 	)
 
 	err := c.db.QueryRowContext(ctx, selectTaskSQL, int64(id)).Scan(
 		&queue, &taskType, &payload, &status, &runAt,
-		&info.Attempt, &info.MaxAttempts, &idempotencyKey, &lastError,
+		&info.Attempt, &info.MaxAttempts, &timeoutNs, &idempotencyKey, &lastError,
 		&createdAt, &updatedAt, &finishedAt,
 	)
 	switch {
@@ -301,6 +316,9 @@ func (c *Client) Get(ctx context.Context, id gorangetask.TaskID) (gorangetask.Ta
 	info.UpdatedAt = updatedAt.UTC()
 	if idempotencyKey.Valid {
 		info.IdempotencyKey = idempotencyKey.String
+	}
+	if timeoutNs.Valid {
+		info.Timeout = time.Duration(timeoutNs.Int64)
 	}
 	if lastError.Valid {
 		info.LastError = lastError.String

@@ -59,6 +59,12 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	return n > 0
 }
 
+// latestMigrationVersion 是 embed 进来的迁移里最高的版本号。
+//
+// 新增迁移文件时**必须同步上调**这个值——它正是本测试想强制的一件事：
+// 迁移文件与"迁移全跑完后应该是什么版本"的期望必须一起改，不能只加文件。
+const latestMigrationVersion = 2 // 0001 建表 + 0002 逐任务超时列
+
 func TestMigrateIntegrationAppliesAndIsIdempotent(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
@@ -74,8 +80,8 @@ func TestMigrateIntegrationAppliesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentVersion() failed: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("CurrentVersion() = %d, want 1", version)
+	if version != latestMigrationVersion {
+		t.Fatalf("CurrentVersion() = %d, want %d", version, latestMigrationVersion)
 	}
 
 	// 再次运行必须安全且不重复应用。
@@ -86,18 +92,18 @@ func TestMigrateIntegrationAppliesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentVersion() after second run failed: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("CurrentVersion() after second run = %d, want 1", version)
+	if version != latestMigrationVersion {
+		t.Fatalf("CurrentVersion() after second run = %d, want %d", version, latestMigrationVersion)
 	}
 
-	// 记录表里只应有一条版本记录。
+	// 记录表里每个版本恰好一条记录。
 	var rows int
 	if err := db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM `+migrationsTable).Scan(&rows); err != nil {
 		t.Fatalf("count migration rows: %v", err)
 	}
-	if rows != 1 {
-		t.Fatalf("migration table has %d rows, want 1", rows)
+	if int64(rows) != latestMigrationVersion {
+		t.Fatalf("migration table has %d rows, want %d", rows, latestMigrationVersion)
 	}
 }
 
@@ -136,6 +142,36 @@ func TestMigrateIntegrationCreatesExpectedIndexes(t *testing.T) {
 		if !got[want] {
 			t.Errorf("expected index %q not found; got %v", want, got)
 		}
+	}
+}
+
+// TestMigrateIntegrationAddsTaskTimeoutColumn 固定 0002 的结果：timeout_ns 存在、
+// 可为 NULL（NULL 表示"未设置，用 Worker 默认超时"）、类型是 BIGINT UNSIGNED
+// （纳秒口径下 time.Duration 的整个取值范围都能装下，不会截断）。
+func TestMigrateIntegrationAddsTaskTimeoutColumn(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate() failed: %v", err)
+	}
+
+	var columnType, nullable string
+	err := db.QueryRowContext(ctx,
+		`SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.columns
+		  WHERE table_schema = DATABASE() AND table_name = 'gotask_tasks'
+		    AND column_name = 'timeout_ns'`).Scan(&columnType, &nullable)
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("column timeout_ns not found; migration 0002 did not apply")
+	}
+	if err != nil {
+		t.Fatalf("read timeout_ns column: %v", err)
+	}
+	if columnType != "bigint unsigned" {
+		t.Errorf("timeout_ns COLUMN_TYPE = %q, want bigint unsigned", columnType)
+	}
+	if nullable != "YES" {
+		t.Errorf("timeout_ns IS_NULLABLE = %q, want YES (NULL 表示未设置)", nullable)
 	}
 }
 
@@ -201,8 +237,8 @@ func TestMigrateIntegrationMarksDirtyOnFailure(t *testing.T) {
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("Migrate() after manual recovery failed: %v", err)
 	}
-	if v, err := CurrentVersion(ctx, db); err != nil || v != 1 {
-		t.Fatalf("CurrentVersion() after recovery = %d, %v; want 1, nil", v, err)
+	if v, err := CurrentVersion(ctx, db); err != nil || v != latestMigrationVersion {
+		t.Fatalf("CurrentVersion() after recovery = %d, %v; want %d, nil", v, err, latestMigrationVersion)
 	}
 }
 
@@ -234,8 +270,8 @@ func TestMigrateIntegrationConcurrentCallsAreSerialized(t *testing.T) {
 		`SELECT COUNT(*) FROM `+migrationsTable).Scan(&rows); err != nil {
 		t.Fatalf("count migration rows: %v", err)
 	}
-	if rows != 1 {
-		t.Fatalf("migration table has %d rows after concurrent runs, want 1", rows)
+	if int64(rows) != latestMigrationVersion {
+		t.Fatalf("migration table has %d rows after concurrent runs, want %d", rows, latestMigrationVersion)
 	}
 }
 

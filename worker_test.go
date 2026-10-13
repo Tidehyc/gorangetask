@@ -1023,3 +1023,85 @@ func TestWorkerStopsLaunchingHandlersAfterShutdown(t *testing.T) {
 		t.Errorf("write-backs during shutdown: retried=%d dead=%d succeeded=%d, want all 0", r, d, s)
 	}
 }
+
+// TestWorkerUsesPerTaskTimeout 固定逐任务超时的两条路径：
+// task.Timeout > 0 时覆盖 Worker 默认值，为 0 时回落到 cfg.HandlerTimeout。
+//
+// 断言方式是"Handler 内等 ctx.Done，把观察到的错误与耗时回传"，不靠墙钟睡眠：
+// 超时没生效时 Handler 会一直等到安全定时器（5s）才返回，断言随即报错，
+// 用例本身不会被挂死。
+func TestWorkerUsesPerTaskTimeout(t *testing.T) {
+	const cutoff = 60 * time.Millisecond
+
+	tests := []struct {
+		name           string
+		taskTimeout    time.Duration
+		handlerTimeout time.Duration
+	}{
+		{
+			// 默认值设成 10s：若逐任务超时没生效，Handler 会一直等到安全定时器。
+			name:           "task timeout overrides the worker default",
+			taskTimeout:    cutoff,
+			handlerTimeout: 10 * time.Second,
+		},
+		{
+			// 任务没设：必须回落到配置里的 60ms。
+			name:           "zero task timeout falls back to the worker default",
+			taskTimeout:    0,
+			handlerTimeout: cutoff,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			task := claimedTask(61, "t", 1, 3)
+			task.Timeout = tt.taskTimeout
+			store := &fakeStore{batches: [][]ClaimedTask{{task}}}
+
+			type observation struct {
+				err     error
+				elapsed time.Duration
+			}
+			seen := make(chan observation, 1)
+
+			reg := NewRegistry()
+			if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+				start := time.Now()
+				select {
+				case <-hctx.Done():
+				case <-time.After(5 * time.Second):
+					// 超时没生效；不阻塞用例，交给断言报错。
+				}
+				seen <- observation{err: hctx.Err(), elapsed: time.Since(start)}
+				return hctx.Err()
+			}); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+
+			cfg := fastConfig()
+			cfg.HandlerTimeout = tt.handlerTimeout
+			w, err := NewWorker(store, reg, cfg)
+			if err != nil {
+				t.Fatalf("NewWorker() unexpected error: %v", err)
+			}
+
+			if _, err := w.runOnce(context.Background()); err != nil {
+				t.Fatalf("runOnce() error: %v", err)
+			}
+
+			got := <-seen
+			if !errors.Is(got.err, context.DeadlineExceeded) {
+				t.Fatalf("handler context error = %v, want context.DeadlineExceeded", got.err)
+			}
+			// 截断只能来自 deadline，不能来自别处：太短说明用错了更小的值，
+			// 接近 5s 说明超时根本没生效（安全定时器兜的底）。
+			if got.elapsed < cutoff/2 || got.elapsed > 2*time.Second {
+				t.Errorf("handler ran for %s before cancellation, want roughly %s", got.elapsed, cutoff)
+			}
+			// 超时是普通的任务失败，应当走重试路径，而不是被当成停机。
+			if retries := store.retryCalls(); len(retries) != 1 {
+				t.Errorf("retry called %d time(s), want 1: a handler timeout is a normal task failure", len(retries))
+			}
+		})
+	}
+}

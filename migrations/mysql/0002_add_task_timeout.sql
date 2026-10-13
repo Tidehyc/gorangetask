@@ -1,0 +1,24 @@
+-- 0002: 为任务表增加逐任务 Handler 超时。
+--
+-- 背景：技术设计 §6 的 Task.Timeout 表示"本次执行的 Handler 超时，零值使用 Worker
+-- 默认值"，但它此前没有对应的列——任务一被领取就丢了，重启或重新领取都无法还原。
+-- 这里补一列把它持久化（对应进度跟踪 §3「持久化逐任务超时」）。
+--
+-- 列语义：
+--   NULL     未设置，本次执行使用 Worker 配置的 HandlerTimeout
+--   非 NULL  该任务本次执行的 Handler 超时，单位**纳秒**
+--
+-- 为什么用纳秒而不是微秒：Go 的 time.Duration 本身就是纳秒计数。若按微秒存，
+-- 小于 1µs 的超时（如 500ns）会被截断成 0，读取方再看到 0 就会把它当成"未设置"
+-- 而回落到默认值——一个显式设置过的超时被静默改写成另一个语义。纳秒口径下
+-- int64 的 time.Duration 取值范围（约 ±292 年）完整落在 BIGINT UNSIGNED 里，
+-- 不存在截断。
+--
+-- 为什么不写 AFTER：MySQL 8.0.12+ 只在"加为最后一列"时支持 ALGORITHM=INSTANT；
+-- 8.0.29 之前把列插到中间位置无法 INSTANT，会退化成需要重建整表的 INPLACE，
+-- 在大表上代价很高。列顺序对语义没有影响，因此追加到末尾。
+-- 本机 MySQL 8.0.46 实测：对已有数据的表追加该列后，
+-- information_schema.INNODB_TABLES 的 TOTAL_ROW_VERSIONS 由 0 变 1
+-- （走行版本化而不是重建表），存量行读新列为 NULL。
+
+ALTER TABLE gotask_tasks ADD COLUMN timeout_ns BIGINT UNSIGNED NULL;

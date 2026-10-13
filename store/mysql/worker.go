@@ -55,8 +55,11 @@ const markRunningSQL = `UPDATE ` + tasksTable + `
     WHERE id = ? AND status = 'pending'`
 
 // selectClaimedTaskSQL 在领取事务提交后按主键回读整行，供 Worker 执行。
+// timeout_ns 一并取回：逐任务超时要靠它还原，否则重启或重新领取后就只剩
+// Worker 的默认值了。
 const selectClaimedTaskSQL = `SELECT
-    queue_name, task_type, payload, attempt, max_attempts, lease_owner, lease_epoch
+    queue_name, task_type, payload, attempt, max_attempts, timeout_ns,
+    lease_owner, lease_epoch
 FROM ` + tasksTable + ` WHERE id = ?`
 
 // 下面三条是状态写回语句，共用同一组 fencing 条件：
@@ -204,12 +207,14 @@ func (c *Client) readClaimedTask(ctx context.Context, id int64) (gorangetask.Cla
 		task            gorangetask.ClaimedTask
 		queue, taskType string
 		payload         []byte
+		timeoutNs       sql.NullInt64
 		owner           sql.NullString
 		leaseEpoch      uint64
 	)
 
 	err := c.db.QueryRowContext(ctx, selectClaimedTaskSQL, id).Scan(
-		&queue, &taskType, &payload, &task.Attempt, &task.MaxAttempts, &owner, &leaseEpoch,
+		&queue, &taskType, &payload, &task.Attempt, &task.MaxAttempts, &timeoutNs,
+		&owner, &leaseEpoch,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -229,6 +234,10 @@ func (c *Client) readClaimedTask(ctx context.Context, id int64) (gorangetask.Cla
 	task.Queue = queue
 	task.Type = taskType
 	task.Payload = json.RawMessage(payload)
+	if timeoutNs.Valid {
+		// 入库时按纳秒存，读取后还原成 time.Duration；NULL 表示未设置，保持 0。
+		task.Timeout = time.Duration(timeoutNs.Int64)
+	}
 	task.Owner = owner.String
 	task.Epoch = leaseEpoch
 	return task, nil

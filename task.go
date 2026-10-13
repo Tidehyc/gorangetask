@@ -97,6 +97,9 @@ type TaskInfo struct {
 	Attempt int
 	// MaxAttempts 是最大尝试次数。
 	MaxAttempts int
+	// Timeout 是本次执行的 Handler 超时；未设置时为 0，表示使用 Worker 配置的
+	// 默认 Handler 超时。
+	Timeout time.Duration
 	// LastError 是最近一次错误的摘要；无错误时为空。
 	LastError string
 	// IdempotencyKey 是任务的幂等键；未设置时为空。

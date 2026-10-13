@@ -114,6 +114,7 @@ func TestPrepare(t *testing.T) {
 		wantMaxAttempts int
 		wantRunAt       any
 		wantIdemKey     any
+		wantTimeoutNs   any
 	}{
 		{
 			name:            "minimal task falls back to configured defaults",
@@ -261,6 +262,40 @@ func TestPrepare(t *testing.T) {
 			task:    gorangetask.Task{Type: "ping", Payload: []byte(`"` + strings.Repeat("x", gorangetask.DefaultMaxPayloadSize) + `"`)},
 			wantErr: gorangetask.ErrInvalidPayload,
 		},
+		{
+			// 这是选纳秒口径的理由：若按微秒存，500ns 会被截断成 0，
+			// 读取方再看到 0 就会当成"未设置"而回落默认值。
+			name:   "sub-microsecond timeout survives truncation",
+			client: def,
+			task: gorangetask.Task{
+				Type:    "ping",
+				Payload: validJSON,
+				Timeout: 500 * time.Nanosecond,
+			},
+			wantQueue:       gorangetask.DefaultQueue,
+			wantType:        "ping",
+			wantMaxAttempts: gorangetask.DefaultMaxAttempts,
+			wantTimeoutNs:   int64(500),
+		},
+		{
+			name:   "explicit timeout is preserved in nanoseconds",
+			client: def,
+			task: gorangetask.Task{
+				Type:    "ping",
+				Payload: validJSON,
+				Timeout: 90 * time.Second,
+			},
+			wantQueue:       gorangetask.DefaultQueue,
+			wantType:        "ping",
+			wantMaxAttempts: gorangetask.DefaultMaxAttempts,
+			wantTimeoutNs:   int64(90 * time.Second),
+		},
+		{
+			name:    "negative timeout is rejected",
+			client:  def,
+			task:    gorangetask.Task{Type: "ping", Payload: validJSON, Timeout: -time.Second},
+			wantErr: gorangetask.ErrInvalidTask,
+		},
 	}
 
 	for _, tc := range tests {
@@ -291,6 +326,9 @@ func TestPrepare(t *testing.T) {
 			}
 			if p.idempotencyKey != tc.wantIdemKey {
 				t.Errorf("idempotencyKey = %v, want %v", p.idempotencyKey, tc.wantIdemKey)
+			}
+			if p.timeoutNs != tc.wantTimeoutNs {
+				t.Errorf("timeoutNs = %v, want %v", p.timeoutNs, tc.wantTimeoutNs)
 			}
 			if string(p.payload) != string(tc.task.Payload) {
 				t.Errorf("payload = %q, want %q (input payload must pass through unchanged)",
