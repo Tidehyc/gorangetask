@@ -107,3 +107,31 @@
 - **payload 解码收进库**：`TypedHandler[T]` 泛型适配器，解码失败 → 永久 `ErrInvalidPayload`；
   未知 task type → `Registry.Resolve` 返回永久 `ErrNoHandler`（`Lookup` 刻意不打标记）。
 - `TypedHandler` 的 `fn == nil` 在**构造期 panic**（启动配置错误尽早暴露）。
+
+## Worker 停机语义（2026-10-13 定，§3 第 4 项）
+
+- `Run(ctx)` 的停机触发只有一个：**ctx 取消**（Worker 没有别的 Stop 入口）。
+  流程＝停止领取 → 取消在途 Handler（ctx 派生传递，协作式）→ 在
+  `Config.ShutdownTimeout` 内等待 → 超时返回公开哨兵 **`ErrShutdownTimeout`**。
+  这是**生命周期信号，不属于「可重试/永久」那套失败分类**，因此不受
+  「不新增公开哨兵」那条约束。
+- **停机期间不写回失败，但仍然确认成功**。判据是 `ctx.Err() != nil`：
+  - 失败 → 只上报，任务**保持 `running`**，等租约自然过期交给回收器。
+    理由：把"被取消"写成 pending 会让别的 Worker 在旧副作用可能仍在途时立刻重跑。
+  - 成功 → 照常 `Succeed`，但必须换用
+    `context.WithTimeout(context.WithoutCancel(ctx), ShutdownTimeout)`；
+    用已取消的 ctx 会让已经干完的活白白重做。
+  后续 §4 加续租/回收时**不要**改成"停机时写回 pending"。
+- 批内停机：`runOnce` 在启动每条 Handler 前检查 `ctx.Err()`，已取消就整批剩余都不启动。
+- ⚠️ 直接后果：停机遗留的 `running` 任务**只能靠回收器回收**，而 reaper 属 §4、
+  目前不存在 ⇒ 这类任务现在会一直挂着。§4 必须补上。
+
+## 测试约定补两条（2026-10-13）
+
+- **真库断言可能因为"错误的原因"通过**：例如停机用例里，即便代码错误地调用
+  `Retry`，它用的是已取消的 ctx，UPDATE 自己就失败了，任务照样留在 running。
+  ⇒ 涉及"某个写回**没有**发生"的断言，必须**同时**在根包用内存 store 断言
+  "对应方法根本没被调用"，光看库侧终态不够。
+- **新写的断言要做「证伪检查」**：把实现里那条关键分支临时破坏（如 `&&` 短路成
+  `false &&`），跑一遍确认用例**真的会失败**，再还原并 `diff` 确认与备份一致。
+  不会失败的断言只是装饰。
