@@ -13,9 +13,11 @@ import (
 
 // 集成测试需要一个可丢弃的 MySQL 数据库：
 //
-//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC'
+//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC&timeout=5s&readTimeout=30s&writeTimeout=30s'
 //
 // 未设置时全部跳过，因此普通的 go test ./... 不受影响。
+// DSN 里三个超时的作用见 store/mysql 里同类说明：驱动默认不设读写期限，
+// MySQL 短暂不响应时查询会无限期挂在 syscall 上，直到包级超时把整个包打掉。
 // 测试会删除该库中的 gotask_tasks 与 gotask_schema_migrations 表。
 //
 // 本包**直接使用 DSN 里的库、不做派生**，并**不会创建该库**：迁移是"建表"

@@ -19,9 +19,16 @@ import (
 
 // 集成测试需要一个可丢弃的 MySQL 数据库：
 //
-//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC'
+//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC&timeout=5s&readTimeout=30s&writeTimeout=30s'
 //
 // 未设置时全部跳过，因此普通的 go test ./... 不受影响。
+//
+// DSN 里的 `timeout`/`readTimeout`/`writeTimeout` 不是可有可无的：go-sql-driver
+// 默认**不设读写期限**，MySQL 侧短暂不响应时，一条 `BeginTx` 会无限期阻塞在
+// `syscall.write` 上（2026-10-15 宿主负载高时实测卡了 8 分钟）。后果不是"这条
+// 用例失败"，而是整个包被 `go test` 的包级超时打掉——日志停在半途，只能拿到一份
+// goroutine dump，且其余用例的结果一并丢失。有了期限，同样的情况会变成一条普通的
+// 连接错误，被 Worker 的上报-重试路径吸收。
 //
 // 用例只通过公开 API（New / Enqueue / EnqueueTx）与只读 SELECT 断言行为，
 // 目的是让"入队写进去的到底长什么样"这件事有据可查。

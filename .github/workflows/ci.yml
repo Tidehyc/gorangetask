@@ -44,7 +44,11 @@ jobs:
       # store 包的集成测试会自行创建派生库 gotask_store，root 用户有权限。
       # parseTime=true 供断言把 DATETIME 扫成 time.Time，loc=UTC 与库里的
       # UTC 时间对齐。
-      GOTASK_TEST_MYSQL_DSN: root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC
+      #
+      # timeout/readTimeout/writeTimeout 给驱动加上期限：不设时 go-sql-driver
+      # 不会给读写设 deadline，MySQL 一旦短暂不响应，查询会无限期挂在 syscall 上，
+      # 表现是整个包被包级超时打掉（而不是某条用例失败），其余结果一并丢失。
+      GOTASK_TEST_MYSQL_DSN: root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC&timeout=5s&readTimeout=30s&writeTimeout=30s
 
     steps:
       - name: Checkout code
