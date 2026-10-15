@@ -2618,3 +2618,558 @@ func mustDecode(t *testing.T, raw json.RawMessage) any {
 	}
 	return v
 }
+
+// --- 终态清理（CleanupFinished） --------------------------------------------
+
+// 这一组的取向与回收器那段一致：把"删了什么、留了什么"钉在真库上。清理是唯一会
+// **物理删除**任务行的语句，删错方向的代价比回收器大得多——被误删的 pending/running
+// 任务既不会被执行，也不会留下任何痕迹。所以每条"不动"的断言都单独写出来，
+// 而不是只看"总删除数对不对"。
+
+// ageFinishedAt 把一条终态任务的 finished_at 往前推 age，用来构造"已过保留期/
+// 未过保留期"的前提。直接改库构造前提，不是假装走产品路径（与 expireLease 同一手法）。
+func ageFinishedAt(t *testing.T, db *sql.DB, id gorangetask.TaskID, age time.Duration) {
+	t.Helper()
+
+	if _, err := db.ExecContext(context.Background(),
+		"UPDATE "+tasksTable+
+			" SET finished_at = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6)) WHERE id = ?",
+		-age.Microseconds(), int64(id)); err != nil {
+		t.Fatalf("age finished_at of task %d: %v", id, err)
+	}
+}
+
+// finishTask 走产品路径把一条新任务推进给定终态，再把 finished_at 往前推 age。
+//
+// 三个终态各有它自己的产品入口：succeeded 经 Succeed、dead 经 MarkDead、
+// canceled 经 Cancel。用例用它来造"已经结束、且结束了多久"的行。
+func finishTask(t *testing.T, c *Client, db *sql.DB, queue, status string, age time.Duration) gorangetask.TaskID {
+	t.Helper()
+	ctx := context.Background()
+
+	id, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue:   queue,
+		Type:    "email.send",
+		Payload: json.RawMessage(`{"to":"a@example.com"}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue for a %s fixture: %v", status, err)
+	}
+
+	if status == "canceled" {
+		if err := c.Cancel(ctx, id); err != nil {
+			t.Fatalf("Cancel task %d: %v", id, err)
+		}
+	} else {
+		claimed := claimOnce(t, c, queue, "cleanup-fixture")
+		if claimed.ID != id {
+			t.Fatalf("claimed task %d, want the one just enqueued (%d)", claimed.ID, id)
+		}
+		switch status {
+		case "succeeded":
+			if err := c.Succeed(ctx, claimed); err != nil {
+				t.Fatalf("Succeed task %d: %v", id, err)
+			}
+		case "dead":
+			if err := c.MarkDead(ctx, claimed, "boom"); err != nil {
+				t.Fatalf("MarkDead task %d: %v", id, err)
+			}
+		default:
+			t.Fatalf("finishTask: unsupported status %q", status)
+		}
+	}
+
+	ageFinishedAt(t, db, id, age)
+	return id
+}
+
+// taskExists 报告任务行是否还在。readTask 在行不存在时会直接 Fatal，
+// 因此"断言已消失"需要这个不会 Fatal 的版本。
+func taskExists(t *testing.T, db *sql.DB, id gorangetask.TaskID) bool {
+	t.Helper()
+
+	var n int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM "+tasksTable+" WHERE id = ?", int64(id)).Scan(&n); err != nil {
+		t.Fatalf("count task %d: %v", id, err)
+	}
+	return n > 0
+}
+
+// waitForTaskGone 轮询等待任务行消失。
+func waitForTaskGone(t *testing.T, db *sql.DB, id gorangetask.TaskID, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		if !taskExists(t, db, id) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %d is still there after %s", id, timeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// cleanupSpec 造一个清理入参，让用例把注意力放在被断言的那一项上。
+func cleanupSpec(status gorangetask.Status, retention time.Duration, limit int) gorangetask.CleanupSpec {
+	return gorangetask.CleanupSpec{Status: status, Retention: retention, Limit: limit}
+}
+
+// TestCleanupDeletesOnlyExpiredTerminalTasksOfTheGivenStatus 是清理的语义基线：
+// 只有"指定终态 + 已过保留期"的行会被删，其余五个方向一个都不能碰。
+//
+// 五个"不该删"各有各的理由，所以逐个断言而不是只比总数：
+//   - 未过期的同终态：保留期还没到；
+//   - 已过期的另一终态：一次调用只清一个终态（这是加锁范围能受 LIMIT 约束的前提）；
+//   - pending / running：它们是队列本身，误删就是任务凭空消失。
+func TestCleanupDeletesOnlyExpiredTerminalTasksOfTheGivenStatus(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue     = "q-cleanup-scope"
+		retention = 7 * 24 * time.Hour
+	)
+
+	expiredSucceeded := finishTask(t, c, db, queue, "succeeded", 8*24*time.Hour)
+	freshSucceeded := finishTask(t, c, db, queue, "succeeded", time.Hour)
+	expiredDead := finishTask(t, c, db, queue, "dead", 40*24*time.Hour)
+	expiredCanceled := finishTask(t, c, db, queue, "canceled", 8*24*time.Hour)
+
+	// pending 与 running 用独立队列：留下来的那条 pending 会改变同队列里的领取顺序，
+	// 混在一起会让前面几个 fixture 的 id 断言变得脆弱。
+	const (
+		queuePending = "q-cleanup-pending"
+		queueRunning = "q-cleanup-running"
+	)
+	pendingID := enqueueForReap(t, c, queuePending, 5)
+	runningID := enqueueForReap(t, c, queueRunning, 5)
+	if claimed := claimOnce(t, c, queueRunning, "cleanup-running"); claimed.ID != runningID {
+		t.Fatalf("claimed task %d, want %d", claimed.ID, runningID)
+	}
+
+	deleted, err := c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, retention, 100))
+	if err != nil {
+		t.Fatalf("CleanupFinished: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("CleanupFinished = %d, want 1: 只有那条过期 succeeded 该被删", deleted)
+	}
+
+	if taskExists(t, db, expiredSucceeded) {
+		t.Errorf("过期的 succeeded %d 还在，want 已删除", expiredSucceeded)
+	}
+	for name, id := range map[string]gorangetask.TaskID{
+		"未过期的 succeeded": freshSucceeded,
+		"已过期的 dead":      expiredDead,
+		"已过期的 canceled":  expiredCanceled,
+		"pending":        pendingID,
+		"running":        runningID,
+	} {
+		if !taskExists(t, db, id) {
+			t.Errorf("%s（task %d）被删了，want 保留", name, id)
+		}
+	}
+
+	// 库侧独立复核：succeeded 只剩那条未过期的。
+	if n := countTasksWithStatus(t, db, "succeeded"); n != 1 {
+		t.Errorf("清理后 succeeded 计数 = %d, want 1", n)
+	}
+}
+
+// TestCleanupNeverDeletesTerminalRowsWithNullFinishedAt 固定兜底方向：finished_at 为
+// NULL 的行**不算过期**。
+//
+// 终态行不该出现 NULL，所以这条不是"常见路径"，而是把方向写死：过期判定依赖可空列时，
+// 一旦把 NULL 当成"早于当前时间"（例如写成 `NOT (finished_at > ...)`），
+// 结束时间不明的行就会被静默删除。宁可少删。
+func TestCleanupNeverDeletesTerminalRowsWithNullFinishedAt(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-cleanup-null-finished"
+
+	id := finishTask(t, c, db, queue, "succeeded", time.Hour)
+	if _, err := db.ExecContext(ctx,
+		"UPDATE "+tasksTable+" SET finished_at = NULL WHERE id = ?", int64(id)); err != nil {
+		t.Fatalf("null out finished_at of task %d: %v", id, err)
+	}
+
+	// 保留期取一个极小的正值：任何"非 NULL 且早于现在"的行都会被选中，
+	// 于是这条用例测的纯粹是 NULL 的处理。
+	deleted, err := c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, time.Nanosecond, 100))
+	if err != nil {
+		t.Fatalf("CleanupFinished: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("CleanupFinished = %d, want 0: finished_at 为 NULL 的行不是过期行", deleted)
+	}
+	if !taskExists(t, db, id) {
+		t.Errorf("finished_at 为 NULL 的 task %d 被删了；兜底方向应为「宁可少删」", id)
+	}
+}
+
+// TestCleanupRespectsLimitAndDeletesOldestFirst 固定两件事：ORDER BY finished_at 的
+// 顺序，以及 Limit 是硬上限。
+//
+// 顺序值得单独钉：调用方用"删满 limit"判断还有没有剩余，如果清理不按时间从旧到新删，
+// 积压里的老行会被新行一直挤到后面——积压的深度就不再收敛。
+func TestCleanupRespectsLimitAndDeletesOldestFirst(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue     = "q-cleanup-limit"
+		retention = time.Hour
+		limit     = 3
+	)
+
+	// 插入顺序刻意与 finished_at 顺序**不一致**：若清理按 id 而不是按 finished_at 排，
+	// 删掉的就会是另外三条，下面的逐条断言立刻能看出来。若两者同序，这条用例对
+	// "ORDER BY 写错"是全盲的。
+	ages := []time.Duration{time.Hour, 5 * time.Hour, 2 * time.Hour, 4 * time.Hour, 3 * time.Hour}
+	ids := make([]gorangetask.TaskID, len(ages))
+	for i, age := range ages {
+		ids[i] = finishTask(t, c, db, queue, "succeeded", age)
+	}
+	// 最旧的三条是索引 1（5h）、3（4h）、4（3h）。
+	wantDeleted := map[int]bool{1: true, 3: true, 4: true}
+
+	deleted, err := c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, retention, limit))
+	if err != nil {
+		t.Fatalf("CleanupFinished: %v", err)
+	}
+	if deleted != limit {
+		t.Fatalf("CleanupFinished = %d, want %d (Limit 是硬上限)", deleted, limit)
+	}
+
+	for i, id := range ids {
+		if got := !taskExists(t, db, id); got != wantDeleted[i] {
+			t.Errorf("task %d（age %s）被删=%v, want %v: 应先删最旧的三条",
+				id, ages[i], got, wantDeleted[i])
+		}
+	}
+
+	// 再清一次：剩下的两条（未满一批）必须被删掉，且计数是"真的删了几行"而不是 limit。
+	deleted, err = c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, retention, limit))
+	if err != nil {
+		t.Fatalf("CleanupFinished (2nd): %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("第二次 CleanupFinished = %d, want 2: 计数是真正删除的行数，不是 limit", deleted)
+	}
+	if n := countTasksWithStatus(t, db, "succeeded"); n != 0 {
+		t.Errorf("两轮清理后仍有 %d 条 succeeded, want 0", n)
+	}
+}
+
+// TestCleanupReturnsZeroWhenNothingMatches 覆盖"没有可删的行"这条最常见的返回：
+// 每个周期都会走到它，必须返回 (0, nil)，而不是把"空结果"当成错误。
+func TestCleanupReturnsZeroWhenNothingMatches(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-cleanup-empty"
+
+	id := finishTask(t, c, db, queue, "succeeded", time.Hour) // 还在保留期内
+
+	deleted, err := c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, 7*24*time.Hour, 100))
+	if err != nil {
+		t.Fatalf("CleanupFinished: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("CleanupFinished = %d, want 0", deleted)
+	}
+	if !taskExists(t, db, id) {
+		t.Errorf("仍在保留期内的 task %d 被删了", id)
+	}
+}
+
+// TestCleanupRejectsInvalidSpec 覆盖入参校验，并顺带证明**校验发生在任何写之前**：
+// 一组非法调用跑完之后，本该被删的过期行必须原封不动。
+//
+// 非终态那两条是这条语句唯一的防误删屏障（validateCleanupSpec 的作用），
+// 因此它们必须是被显式测过的，而不是"靠调用方自觉"。
+func TestCleanupRejectsInvalidSpec(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-cleanup-invalid"
+
+	id := finishTask(t, c, db, queue, "succeeded", 40*24*time.Hour)
+
+	tests := []struct {
+		name string
+		spec gorangetask.CleanupSpec
+	}{
+		{"非终态 pending", cleanupSpec(gorangetask.StatusPending, time.Hour, 10)},
+		{"非终态 running", cleanupSpec(gorangetask.StatusRunning, time.Hour, 10)},
+		{"保留期为零", cleanupSpec(gorangetask.StatusSucceeded, 0, 10)},
+		{"保留期为负", cleanupSpec(gorangetask.StatusSucceeded, -time.Hour, 10)},
+		{"批大小为零", cleanupSpec(gorangetask.StatusSucceeded, time.Hour, 0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := c.CleanupFinished(ctx, tt.spec); !errors.Is(err, gorangetask.ErrInvalidConfig) {
+				t.Errorf("CleanupFinished(%+v) error = %v, want ErrInvalidConfig", tt.spec, err)
+			}
+		})
+	}
+
+	// 一连串非法调用之后，过期行必须还在：校验必须先于选行与删除。
+	if !taskExists(t, db, id) {
+		t.Errorf("task %d 被非法入参的调用删掉了；校验必须发生在任何写之前", id)
+	}
+}
+
+// TestCleanupReleasesIdempotencyKey 固定"删除会释放幂等键"这个已知副作用
+// （技术设计 §3）：保留期内同键必须被拒，清理之后同键可以重新接受。
+//
+// 这条既是给使用方看的边界，也是防止日后有人把清理做成"软删除"——软删除不会释放
+// 唯一索引，这个用例会立刻失败。
+func TestCleanupReleasesIdempotencyKey(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue     = "q-cleanup-idem"
+		key       = "order-42"
+		retention = 7 * 24 * time.Hour
+	)
+
+	enqueue := func() (gorangetask.TaskID, error) {
+		return c.Enqueue(ctx, gorangetask.Task{
+			Queue:          queue,
+			Type:           "email.send",
+			Payload:        json.RawMessage(`{}`),
+			IdempotencyKey: key,
+		})
+	}
+
+	id, err := enqueue()
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed := claimOnce(t, c, queue, "cleanup-idem")
+	if err := c.Succeed(ctx, claimed); err != nil {
+		t.Fatalf("Succeed task %d: %v", id, err)
+	}
+	ageFinishedAt(t, db, id, 30*24*time.Hour)
+
+	// 行还在（保留期外但尚未清理）：幂等键仍被占用。
+	if _, err := enqueue(); !errors.Is(err, gorangetask.ErrDuplicateTask) {
+		t.Fatalf("保留期内的重复入队 error = %v, want ErrDuplicateTask", err)
+	}
+
+	if _, err := c.CleanupFinished(ctx, cleanupSpec(gorangetask.StatusSucceeded, retention, 100)); err != nil {
+		t.Fatalf("CleanupFinished: %v", err)
+	}
+	if taskExists(t, db, id) {
+		t.Fatalf("task %d 未被清理，后续断言失去意义", id)
+	}
+
+	// 行被物理删除后，唯一索引不再被占用。
+	if _, err := enqueue(); err != nil {
+		t.Errorf("清理后同键入队 error = %v, want nil: 删除会释放幂等键", err)
+	}
+}
+
+// TestCleanupQueryUsesTheCoveringIndex 钉住清理那条加锁读的执行计划。
+//
+// 与回收器（TestReapLockingReadStaysOnLeaseIndex）的关键差别：这条读**只取 id**，
+// 而三列 (status, finished_at, id) 全在 ix_gotask_cleanup 里，是天然的覆盖索引，
+// 因此不需要 FORCE INDEX。这条用例就是那个结论的回归哨兵——一旦有人往 SELECT 里
+// 多加一列（比如为了日志取 queue_name），计划会离开索引，此处立刻失败。
+//
+// 第二层断言是 **Extra 里不能有 filesort**：status 用等值前缀时，索引的后两列
+// (finished_at, id) 仍然有序，ORDER BY 与 LIMIT 都吃索引顺序。一旦退化成 filesort，
+// 优化器必须先物化全部候选行才排序，FOR UPDATE 的加锁范围就不再受 LIMIT 约束
+// （技术设计附录 A 记的正是这类事故）。
+func TestCleanupQueryUsesTheCoveringIndex(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	const (
+		queue     = "q-cleanup-plan"
+		tasks     = 12
+		retention = 7 * 24 * time.Hour
+		limit     = 3
+	)
+	for i := 0; i < tasks; i++ {
+		finishTask(t, c, db, queue, "succeeded", time.Duration(24*(i+8))*time.Hour)
+	}
+
+	key, extra := explainPlan(t, db, cleanupIDsSQL,
+		string(gorangetask.StatusSucceeded), -int64(retention.Microseconds()), limit)
+
+	if key != "ix_gotask_cleanup" {
+		t.Errorf("清理加锁读选用的索引 = %q (Extra=%q), want ix_gotask_cleanup: "+
+			"计划一旦离开这个覆盖索引，FOR UPDATE 就会扫描并锁住更多行", key, extra)
+	}
+	if strings.Contains(extra, "filesort") {
+		t.Errorf("清理加锁读的计划 = %q，出现了 filesort: "+
+			"等值前缀不再保证 (finished_at, id) 有序，加锁范围会越过 LIMIT", extra)
+	}
+}
+
+// TestCleanupLockingReadScopeStaysWithinLimit 用两个手写事务复现"加锁范围"这件事：
+// tx1 锁住 limit 行且不提交时，tx2 执行同一条读必须仍能拿到 limit 行、且与 tx1 不相交。
+//
+// 这就是 SKIP LOCKED 在清理里的全部意义：集群里多个 Worker 各跑各的清理器时，
+// 它们彼此跳过对方已锁定的行，而不是互相挡住。刻意用手写事务而不是并发 Worker，
+// 要的是确定性，而不是把成败压在 goroutine 调度上。
+func TestCleanupLockingReadScopeStaysWithinLimit(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue     = "q-cleanup-lock-scope"
+		tasks     = 12
+		limit     = 3
+		retention = 7 * 24 * time.Hour
+	)
+	for i := 0; i < tasks; i++ {
+		finishTask(t, c, db, queue, "succeeded", time.Duration(24*(i+8))*time.Hour)
+	}
+	retentionMicros := -int64(retention.Microseconds())
+
+	// 开事务、跑完加锁读后**不提交**：锁保留到用例结束（Cleanup 里 Rollback）。
+	lockAndRead := func(t *testing.T, label string) []gorangetask.TaskID {
+		t.Helper()
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("%s begin: %v", label, err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback() })
+
+		rows, err := tx.QueryContext(ctx, cleanupIDsSQL, string(gorangetask.StatusSucceeded), retentionMicros, limit)
+		if err != nil {
+			t.Fatalf("%s query: %v", label, err)
+		}
+		defer func() { _ = rows.Close() }()
+
+		var ids []gorangetask.TaskID
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				t.Fatalf("%s scan: %v", label, err)
+			}
+			ids = append(ids, gorangetask.TaskID(id))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s read rows: %v", label, err)
+		}
+		return ids
+	}
+
+	first := lockAndRead(t, "tx1")
+	if len(first) != limit {
+		t.Fatalf("tx1 选中 %d 行, want %d", len(first), limit)
+	}
+
+	second := lockAndRead(t, "tx2")
+	if len(second) != limit {
+		t.Errorf("tx1 已锁 %v 时 tx2 只选中 %d 行, want %d: "+
+			"加锁读越过了 LIMIT，把 tx1 之外的行也锁住了（SKIP LOCKED 失效）",
+			first, len(second), limit)
+	}
+
+	seen := make(map[gorangetask.TaskID]bool, limit)
+	for _, id := range first {
+		seen[id] = true
+	}
+	for _, id := range second {
+		if seen[id] {
+			t.Errorf("task %d 被两个加锁读同时选中：SKIP LOCKED 失效", id)
+		}
+	}
+}
+
+// TestCleanupIsSafeWithConcurrentCleaners 验证多个清理器同时跑不会漏删也不会重复计数。
+//
+// 断言分两层，与并发回收器那套一致：进程侧看**删除总数恰好等于任务数**；
+// 库里再独立复核一次——succeeded 一行不剩。limit 刻意取 tasks/cleaners，
+// 一个清理器一轮吃不下全部；否则可能被一个清理器抢光，断言照样全绿却什么并发都没验证到。
+func TestCleanupIsSafeWithConcurrentCleaners(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue     = "q-cleanup-concurrent"
+		tasks     = 12
+		cleaners  = 4
+		retention = 7 * 24 * time.Hour
+	)
+	for i := 0; i < tasks; i++ {
+		finishTask(t, c, db, queue, "succeeded", time.Duration(24*(i+8))*time.Hour)
+	}
+	spec := cleanupSpec(gorangetask.StatusSucceeded, retention, tasks/cleaners)
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		deleted int64
+	)
+	errs := make([]error, cleaners)
+	for i := 0; i < cleaners; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				n, err := c.CleanupFinished(ctx, spec)
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				if n == 0 {
+					return
+				}
+				mu.Lock()
+				deleted += n
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("cleaner %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	total := deleted
+	mu.Unlock()
+	if total != tasks {
+		t.Errorf("删除总数 = %d, want %d", total, tasks)
+	}
+	if n := countTasksWithStatus(t, db, "succeeded"); n != 0 {
+		t.Errorf("并发清理后仍有 %d 条 succeeded, want 0", n)
+	}
+}
+
+// TestWorkerCleansUpExpiredTerminalTasksOnItsInterval 是清理的端到端验收：一个按
+// CleanupInterval 周期跑起来的 Worker，真的会把过期的终态行删掉、并放过还在保留期内的行。
+//
+// 前面那些用例都直接调 store 方法，验证不到"配置 -> 循环 -> spec -> SQL"这条链；
+// 而这条链上任何一环接错（比如保留期传错、状态传错）都不会被前面的用例发现。
+func TestWorkerCleansUpExpiredTerminalTasksOnItsInterval(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	const queue = "q-worker-cleanup"
+
+	expired := finishTask(t, c, db, queue, "succeeded", 8*24*time.Hour)
+	fresh := finishTask(t, c, db, queue, "succeeded", time.Hour)
+
+	cfg := workerConfig(queue)
+	cfg.SucceededRetention = 7 * 24 * time.Hour
+	cfg.CleanupInterval = 20 * time.Millisecond
+	cfg.CleanupBatchSize = 100
+
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "email.send", func(context.Context, json.RawMessage) error { return nil })
+
+	w, err := gorangetask.NewWorker(c, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	startWorker(t, w)
+
+	waitForTaskGone(t, db, expired, 10*time.Second)
+
+	if !taskExists(t, db, fresh) {
+		t.Errorf("仍在保留期内的 task %d 被删了", fresh)
+	}
+}

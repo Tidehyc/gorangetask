@@ -39,6 +39,24 @@ type fakeStore struct {
 	// 停机瞬间失败"这类只在特定时序下出现的路径。
 	onReap func(ctx context.Context, call int, limit int)
 
+	// cleanupCalls 记录清理器的每次调用（存完整的 spec）。与 reapLimits 同理：
+	// 根包这层只观察"清理由谁、按什么节奏、按什么保留期发起"；删除的语义
+	// （只删指定终态、只看数据库时钟）由 store/mysql 的真库用例钉住。
+	cleanupCalls []CleanupSpec
+
+	// cleanupErr 为非 nil 时让清理调用失败；入参是本次的 spec，便于只让某一个
+	// 终态失败，验证"单个目标失败不影响其他目标"。
+	cleanupErr func(spec CleanupSpec) error
+
+	// cleanupDeleted 决定第 call 次（从 1 开始）调用返回的删除行数；为 nil 时
+	// 返回 spec.Limit（"删满"），于是循环会一直取批直到上限。用例用它制造
+	// "没删满即停"与"要跑满 cleanupMaxBatches 批"。
+	cleanupDeleted func(spec CleanupSpec, call int) int64
+
+	// onCleanup 在记录完一次清理调用后执行，供用例做同步点，或制造"清理恰好在
+	// 停机瞬间失败"这类只在特定时序下出现的路径。
+	onCleanup func(ctx context.Context, call int, spec CleanupSpec)
+
 	// onSucceed 在成功确认后被调用（用于测试里等待异步处理完成）。
 	onSucceed func(TaskID)
 
@@ -172,6 +190,34 @@ func (f *fakeStore) ReapExpiredLeases(ctx context.Context, limit int) (ReapResul
 	return ReapResult{}, err
 }
 
+// CleanupFinished 记录一次清理调用，并调用 onCleanup 供用例同步。
+// 返回的删除行数由 cleanupDeleted 决定，缺省为 spec.Limit（"删满"）。
+func (f *fakeStore) CleanupFinished(ctx context.Context, spec CleanupSpec) (int64, error) {
+	if err := f.ctxErr(ctx); err != nil {
+		return 0, err
+	}
+
+	f.mu.Lock()
+	f.cleanupCalls = append(f.cleanupCalls, spec)
+	call := len(f.cleanupCalls)
+	hook, errFn, decide := f.onCleanup, f.cleanupErr, f.cleanupDeleted
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook(ctx, call, spec)
+	}
+
+	var err error
+	if errFn != nil {
+		err = errFn(spec)
+	}
+	deleted := int64(spec.Limit)
+	if decide != nil {
+		deleted = decide(spec, call)
+	}
+	return deleted, err
+}
+
 // noteWriteBack 记录一次状态写回，并检查它是否与续租重叠：
 // process 必须"先停看护、再写回"，重叠就说明这个顺序被破坏了。
 func (f *fakeStore) noteWriteBack() {
@@ -229,6 +275,26 @@ func (f *fakeStore) reaped() []int {
 	return append([]int(nil), f.reapLimits...)
 }
 
+// cleanups 返回清理器每次调用时传下去的 spec（按调用顺序）。
+func (f *fakeStore) cleanups() []CleanupSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]CleanupSpec(nil), f.cleanupCalls...)
+}
+
+// cleanupCountFor 统计清理器对某个终态累计发起了多少次调用。
+func (f *fakeStore) cleanupCountFor(status Status) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, spec := range f.cleanupCalls {
+		if spec.Status == status {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *fakeStore) wroteBackWhileRenewing() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -269,6 +335,11 @@ func fastConfig() Config {
 		Concurrency:     1,
 		PollInterval:    time.Millisecond,
 		MaxPollInterval: 5 * time.Millisecond,
+		// 清理器默认关掉：它给每次 Run 多加一个停机参与者，而停机超时的归因
+		// 用例断言的是消息原文，多一边就可能让"handlers ... and the reaper
+		// not stopped"这类判定依赖于"清理协程恰好在预算内被调度到"。清理相关
+		// 的用例各自显式打开它（见 §4 第 6 项的用例）。
+		CleanupInterval: -1,
 	}
 }
 
@@ -2286,5 +2357,511 @@ func TestWorkerKeepsProcessingBatchAfterHandlerPanic(t *testing.T) {
 	retries := store.retryCalls()
 	if len(retries) != 1 || retries[0].task.ID != 51 {
 		t.Errorf("retries = %v, want exactly task 51", retries)
+	}
+}
+
+// --- 终态清理（§4 第 6 项） -------------------------------------------------
+
+// cleanupSpecsByStatus 按终态整理一遍 spec，便于用"每个终态各一次"这类断言。
+func cleanupSpecsByStatus(specs []CleanupSpec) map[Status]CleanupSpec {
+	out := make(map[Status]CleanupSpec, len(specs))
+	for _, spec := range specs {
+		out[spec.Status] = spec
+	}
+	return out
+}
+
+// TestWorkerCleanupSpecsCoverEveryTerminalWithItsRetention 固定"清谁、按什么保留期"：
+// succeeded 与 canceled 共用成功保留期，dead 用死信保留期（技术设计 §5.7）。
+// 这条直接测函数、不经协程，因此可以逐字段钉住，不受时序影响。
+func TestWorkerCleanupSpecsCoverEveryTerminalWithItsRetention(t *testing.T) {
+	cfg := fastConfig()
+	cfg.CleanupInterval = time.Hour // 打开清理器
+	cfg.SucceededRetention = 3 * time.Hour
+	cfg.DeadRetention = 72 * time.Hour
+	cfg.CleanupBatchSize = 7
+
+	w, err := NewWorker(&fakeStore{}, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	specs := w.cleanupSpecs()
+	if len(specs) != 3 {
+		t.Fatalf("cleanupSpecs() returned %d spec(s), want 3", len(specs))
+	}
+	byStatus := cleanupSpecsByStatus(specs)
+
+	for _, status := range []Status{StatusSucceeded, StatusCanceled, StatusDead} {
+		if _, ok := byStatus[status]; !ok {
+			t.Errorf("cleanupSpecs() misses terminal %s; its rows would accumulate forever", status)
+		}
+	}
+	if got, want := byStatus[StatusSucceeded].Retention, cfg.SucceededRetention; got != want {
+		t.Errorf("succeeded retention = %s, want %s", got, want)
+	}
+	if got, want := byStatus[StatusCanceled].Retention, cfg.SucceededRetention; got != want {
+		t.Errorf("canceled retention = %s, want the succeeded retention %s", got, want)
+	}
+	if got, want := byStatus[StatusDead].Retention, cfg.DeadRetention; got != want {
+		t.Errorf("dead retention = %s, want %s", got, want)
+	}
+	for status, spec := range byStatus {
+		if spec.Limit != cfg.CleanupBatchSize {
+			t.Errorf("%s cleanup limit = %d, want CleanupBatchSize %d", status, spec.Limit, cfg.CleanupBatchSize)
+		}
+		if !spec.Status.IsTerminal() {
+			t.Errorf("%s is not a terminal status; cleanup must not target it", status)
+		}
+	}
+}
+
+// TestWorkerCleanupTakesBatchesUntilNotFull 钉住"没删满即停"这个唯一判断：
+// 删满时要继续取批（追赶积压），没删满就立刻停（再问一次只是空查询）。
+// 直接调 runCleanupRound，避开协程与 ticker，因此批数可逐次断言。
+func TestWorkerCleanupTakesBatchesUntilNotFull(t *testing.T) {
+	cfg := fastConfig()
+	cfg.CleanupInterval = time.Hour
+	cfg.CleanupBatchSize = 5
+
+	store := &fakeStore{}
+	// 只让 succeeded 的前两批删满、第三批没删满；其余终态一律没删满。
+	var succeededBatches int
+	store.cleanupDeleted = func(spec CleanupSpec, _ int) int64 {
+		if spec.Status != StatusSucceeded {
+			return 0
+		}
+		succeededBatches++
+		if succeededBatches <= 2 {
+			return int64(spec.Limit)
+		}
+		return 2 // 没删满：说明清干净了
+	}
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	w.runCleanupRound(context.Background())
+
+	if got, want := store.cleanupCountFor(StatusSucceeded), 3; got != want {
+		t.Errorf("succeeded cleaned in %d batch(es), want %d (2 full batches + the short one)", got, want)
+	}
+	for _, status := range []Status{StatusCanceled, StatusDead} {
+		if got := store.cleanupCountFor(status); got != 1 {
+			t.Errorf("%s cleaned in %d batch(es), want 1 (a short batch must stop the loop)", status, got)
+		}
+	}
+}
+
+// TestWorkerCleanupStopsAtBatchCapWhenAlwaysFull 钉住上限：把一个终态清成"永远删满"
+// 时，一轮不会无限期跑下去，最多 cleanupMaxBatches 批，剩下的留到下个周期。
+// 上限的意义是让一轮有确定的时长，而不是让清理把 Worker 一直占住。
+func TestWorkerCleanupStopsAtBatchCapWhenAlwaysFull(t *testing.T) {
+	cfg := fastConfig()
+	cfg.CleanupInterval = time.Hour
+	cfg.CleanupBatchSize = 4
+
+	store := &fakeStore{} // 缺省即"每次都删满 limit"
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	w.runCleanupRound(context.Background())
+
+	// 10 是技术设计里写死的上限（每轮、每个终态最多 10 × CleanupBatchSize 行）。
+	// 这里写死字面量而**不**引用 cleanupMaxBatches：拿被测代码自己的常量当期望值，
+	// 断言就退化成"实现等于它自己"，把上限改成 20 也照样通过——证伪检查正是靠
+	// 这一点发现过它是空断言。
+	const wantBatches = 10
+	for _, status := range []Status{StatusSucceeded, StatusCanceled, StatusDead} {
+		if got := store.cleanupCountFor(status); got != wantBatches {
+			t.Errorf("%s cleaned in %d batch(es), want the cap %d", status, got, wantBatches)
+		}
+	}
+}
+
+// TestWorkerCleanupFailureOnOneTerminalDoesNotStopTheOthers 守住 runCleanupRound
+// 的分状态设计：三种终态的保留期彼此独立，succeeded 的一次抖动没有理由顺带把
+// dead 的清理也停掉——那会让死信表单独长下去，而没人会注意到。
+func TestWorkerCleanupFailureOnOneTerminalDoesNotStopTheOthers(t *testing.T) {
+	cfg := fastConfig()
+	cfg.CleanupInterval = time.Hour
+
+	store := &fakeStore{}
+	store.cleanupDeleted = func(CleanupSpec, int) int64 { return 0 } // 每态一批
+	store.cleanupErr = func(spec CleanupSpec) error {
+		if spec.Status == StatusSucceeded {
+			return errors.New("succeeded cleanup exploded")
+		}
+		return nil
+	}
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	w.runCleanupRound(context.Background())
+
+	if got := store.cleanupCountFor(StatusSucceeded); got != 1 {
+		t.Errorf("succeeded cleaned %d time(s), want 1: a failing target must not be retried in a tight loop", got)
+	}
+	for _, status := range []Status{StatusCanceled, StatusDead} {
+		if got := store.cleanupCountFor(status); got != 1 {
+			t.Errorf("%s cleaned %d time(s), want 1: one target's failure must not block the others", status, got)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "cleanup succeeded tasks") {
+			return
+		}
+	}
+	t.Errorf("the failed target's error was never reported, got %v", reported)
+}
+
+// TestWorkerCleansUpOnConfiguredInterval 证明清理协程真的按 CleanupInterval 跑起来了，
+// 且以 CleanupBatchSize 为批量上限。"起了个协程"如果只写在注释里，是没法被检验的。
+// 只等到一轮无法区分"按周期跑"和"启动时跑了一次"，所以等到第二轮。
+func TestWorkerCleansUpOnConfiguredInterval(t *testing.T) {
+	store := &fakeStore{}
+	store.cleanupDeleted = func(CleanupSpec, int) int64 { return 0 } // 每轮 = 每态一批
+
+	cfg := fastConfig()
+	cfg.CleanupInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	waitUntil(t, 5*time.Second, "the cleanup never ran", func() bool {
+		return store.cleanupCountFor(StatusSucceeded) >= 2
+	})
+
+	cancel()
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil after a clean shutdown", err)
+	}
+
+	for _, spec := range store.cleanups() {
+		if spec.Limit != w.cfg.CleanupBatchSize {
+			t.Errorf("cleanup limit = %d, want CleanupBatchSize (%d)", spec.Limit, w.cfg.CleanupBatchSize)
+		}
+	}
+}
+
+// TestWorkerCleanupKeepsGoingAfterInfrastructureErrors 与回收器同一条约定：
+// 清理能力不能被一次数据库抖动关掉，否则表会一直长下去，而没人会注意到。
+func TestWorkerCleanupKeepsGoingAfterInfrastructureErrors(t *testing.T) {
+	store := &fakeStore{}
+	store.cleanupErr = func(CleanupSpec) error { return errors.New("cleanup exploded") }
+
+	cfg := fastConfig()
+	cfg.CleanupInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	// 等到第二次：失败之后还能来第二次，才说明循环没被这次错误终结。
+	waitUntil(t, 5*time.Second, "the cleanup stopped after an infrastructure error", func() bool {
+		return store.cleanupCountFor(StatusSucceeded) >= 2
+	})
+
+	cancel()
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "cleanup succeeded tasks") {
+			return
+		}
+	}
+	t.Errorf("the cleanup failure was never reported, got %v", reported)
+}
+
+// TestWorkerCleanupCanBeDisabled 对照验证 CleanupInterval 的负值确实关掉了清理。
+// 与回收器同一套写法：两个子用例共用同一个时间窗，让"正间隔至少跑了两轮"给
+// "负间隔一轮都没跑"提供参照——只断言"没跑"也可能只是协程还没被调度到。
+func TestWorkerCleanupCanBeDisabled(t *testing.T) {
+	const (
+		interval = 5 * time.Millisecond
+		window   = 60 * time.Millisecond
+	)
+
+	countCleanups := func(t *testing.T, cleanupInterval time.Duration) int {
+		t.Helper()
+		store := &fakeStore{}
+		store.cleanupDeleted = func(CleanupSpec, int) int64 { return 0 }
+
+		cfg := fastConfig()
+		cfg.CleanupInterval = cleanupInterval
+
+		w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+		if err != nil {
+			t.Fatalf("NewWorker() unexpected error: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runDone := make(chan error, 1)
+		go func() { runDone <- w.Run(ctx) }()
+
+		time.Sleep(window)
+		cancel()
+		if err := waitRun(t, runDone); err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+		return store.cleanupCountFor(StatusSucceeded)
+	}
+
+	if enabled := countCleanups(t, interval); enabled < 2 {
+		t.Fatalf("cleaned %d time(s) in %s with a %s interval; the cleaner is not running",
+			enabled, window, interval)
+	}
+	if disabled := countCleanups(t, -1); disabled != 0 {
+		t.Errorf("cleaned %d time(s) with CleanupInterval = -1, want 0", disabled)
+	}
+}
+
+// TestWorkerShutdownTimeoutBlamesTheCleanup 覆盖"Handler 与回收器都退了、只有清理器
+// 没停"。三部分各自独立，超时消息必须点出是哪一边，否则排查会被误导到 Handler 上。
+// 回收器在这里显式关掉，好让这条用例只依赖清理器的行为。
+func TestWorkerShutdownTimeoutBlamesTheCleanup(t *testing.T) {
+	cleanupEntered := make(chan struct{}, 1)
+	releaseCleanup := make(chan struct{})
+	t.Cleanup(func() { close(releaseCleanup) })
+
+	store := &fakeStore{}
+	store.onCleanup = func(context.Context, int, CleanupSpec) {
+		select {
+		case cleanupEntered <- struct{}{}:
+		default:
+		}
+		<-releaseCleanup // 故意无视 ctx 的清理调用
+	}
+
+	cfg := fastConfig()
+	cfg.ReapInterval = -1 // 只留清理器这一边没停
+	cfg.CleanupInterval = 5 * time.Millisecond
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-cleanupEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cleanup never entered a cleanup call")
+	}
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrShutdownTimeout) {
+			t.Fatalf("Run() = %v, want ErrShutdownTimeout", err)
+		}
+		if !strings.Contains(err.Error(), "the cleanup not stopped") {
+			t.Errorf("Run() error %q should blame the cleanup", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return")
+	}
+}
+
+// TestWorkerDoesNotReportCleanupFailuresCausedByShutdown 覆盖"清理恰好在停机瞬间
+// 失败"：驱动会因为 ctx 已取消而报错，那看上去像一条基础设施故障，实际只是停机的
+// 附带结果，不该被上报（与回收器对同一情形的处理一致）。
+func TestWorkerDoesNotReportCleanupFailuresCausedByShutdown(t *testing.T) {
+	store := &fakeStore{}
+	store.cleanupErr = func(CleanupSpec) error { return errors.New("cleanup exploded") }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 让清理在"ctx 刚好被取消"的瞬间失败，这正是停机打断基础设施调用的样子。
+	store.onCleanup = func(context.Context, int, CleanupSpec) { cancel() }
+
+	cfg := fastConfig()
+	cfg.CleanupInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	// 反向确认这条用例不是空转：清理确实被调用过。
+	if n := len(store.cleanups()); n == 0 {
+		t.Fatal("the cleanup never ran; this case would pass vacuously")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "cleanup succeeded tasks") {
+			t.Errorf("a cleanup failure caused by shutdown was reported as infrastructure trouble: %v", err)
+		}
+	}
+}
+
+// TestWorkerShutdownTimeoutBlamesAllThreeSides 覆盖"Handler、回收器、清理器都没停"
+// 这种最难查的情形：超时消息必须把三边按英文习惯列全（"a, b and c"），否则运维
+// 只能看到一句含糊的"超时了"。
+func TestWorkerShutdownTimeoutBlamesAllThreeSides(t *testing.T) {
+	handlerEntered := make(chan struct{}, 1)
+	reapEntered := make(chan struct{}, 1)
+	cleanupEntered := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	releaseReap := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	t.Cleanup(func() { close(releaseHandler); close(releaseReap); close(releaseCleanup) })
+
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(71, "t", 1, 3)}}}
+	store.onReap = func(context.Context, int, int) {
+		select {
+		case reapEntered <- struct{}{}:
+		default:
+		}
+		<-releaseReap
+	}
+	store.onCleanup = func(context.Context, int, CleanupSpec) {
+		select {
+		case cleanupEntered <- struct{}{}:
+		default:
+		}
+		<-releaseCleanup
+	}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		select {
+		case handlerEntered <- struct{}{}:
+		default:
+		}
+		<-releaseHandler // 无视 ctx 的 Handler
+		return errors.New("released after the worker gave up")
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+	cfg.CleanupInterval = 5 * time.Millisecond
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	for name, ch := range map[string]<-chan struct{}{
+		"handler": handlerEntered, "reaper": reapEntered, "cleanup": cleanupEntered,
+	} {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s never started", name)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrShutdownTimeout) {
+			t.Fatalf("Run() = %v, want ErrShutdownTimeout", err)
+		}
+		want := "handlers still running, the reaper not stopped and the cleanup not stopped"
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Run() error %q should read %q", err, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return")
+	}
+}
+
+// TestStillRunningReadsAsAnEnglishList 把停机超时消息的措辞钉死：三种"谁没停"的
+// 组合都要能读成一句英文清单，而不是待办事项般的逗号堆叠。纯函数、无时序。
+func TestStillRunningReadsAsAnEnglishList(t *testing.T) {
+	tests := []struct {
+		name                      string
+		handlers, reaper, cleanup bool
+		want                      string
+	}{
+		{"只有回收器没停", true, false, true, "the reaper not stopped"},
+		{"只有清理器没停", true, true, false, "the cleanup not stopped"},
+		{"只有 Handler 没退", false, true, true, "handlers still running"},
+		{"Handler 与回收器", false, false, true, "handlers still running and the reaper not stopped"},
+		{"Handler 与清理器", false, true, false, "handlers still running and the cleanup not stopped"},
+		{"回收器与清理器", true, false, false, "the reaper not stopped and the cleanup not stopped"},
+		{"三者都没停", false, false, false,
+			"handlers still running, the reaper not stopped and the cleanup not stopped"},
+		{"三者都停了", true, true, true, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stillRunning(tt.handlers, tt.reaper, tt.cleanup); got != tt.want {
+				t.Errorf("stillRunning(%v, %v, %v) = %q, want %q",
+					tt.handlers, tt.reaper, tt.cleanup, got, tt.want)
+			}
+		})
 	}
 }

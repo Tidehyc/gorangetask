@@ -101,7 +101,7 @@ func TestConfigDefaultsDoNotOverrideExplicitValues(t *testing.T) {
 	if got.HandlerTimeout != 2*time.Minute || got.LeaseDuration != time.Minute {
 		t.Error("explicit duration values should not be overwritten")
 	}
-	// 回收间隔是有含义的负值开关之外唯一的可配项，默认值不得覆盖显式值。
+	// 回收间隔与清理间隔是"负值 = 关闭"这类有含义的开关，默认值不得覆盖显式值。
 	if got.ReapInterval != 45*time.Second {
 		t.Errorf("ReapInterval = %s, want 45s: an explicit value must not be overwritten", got.ReapInterval)
 	}
@@ -118,6 +118,24 @@ func TestConfigReapIntervalNegativeDisables(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil: 负值表示关闭回收器，是合法配置", err)
+	}
+}
+
+// TestConfigCleanupIntervalNegativeDisables 把清理器也钉在同一个开关约定上。
+//
+// 它与回收器分开断言、而不是并到一个表里：两个开关的**后果完全不同**——
+// 关闭回收器只是让崩溃遗留的任务没人接手（有租约兜底），关闭清理器则会让终态
+// 记录无限增长。约定相同不代表可以在测试里含糊过去，关闭清理器的部署必须在
+// README 里写明代价。
+func TestConfigCleanupIntervalNegativeDisables(t *testing.T) {
+	cfg := Config{CleanupInterval: -1}.WithDefaults()
+
+	if cfg.CleanupInterval != -1 {
+		t.Errorf("CleanupInterval = %s after WithDefaults, want -1: 负值是有含义的开关，不能被默认值吃掉",
+			cfg.CleanupInterval)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil: 负值表示关闭清理器，是合法配置", err)
 	}
 }
 

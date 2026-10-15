@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,6 +71,26 @@ type ReapResult struct {
 	ToDead int
 }
 
+// CleanupSpec 是一次终态清理的输入。
+//
+// 它是"每个终态各清一次"的粒度，而不是一次清掉所有终态：三种终态的保留期并不同
+// （见 Config.SucceededRetention / DeadRetention），而且分状态执行才能让底层的
+// 加锁读停在 (status, finished_at, id) 这个索引的**等值前缀**上——换成
+// `status IN (...)`，索引无法再保证按 (finished_at, id) 有序，优化器会退化成
+// 范围扫描 + filesort，加锁范围随之失控（技术设计附录 A 记的就是同类事故）。
+type CleanupSpec struct {
+	// Status 是要清理的终态，只允许 succeeded / dead / canceled。
+	Status Status
+	// Retention 是保留期，必须大于 0。
+	//
+	// 边界由实现用**数据库时钟**计算（只删除 finished_at 早于
+	// `UTC_TIMESTAMP(6) - Retention` 的行），调用方不传绝对时刻：多机时钟不同步时，
+	// 绝对时刻会让不同 Worker 删掉不同的行。这与租约到期判定的口径一致。
+	Retention time.Duration
+	// Limit 是本次最多删除的行数，必须大于 0。
+	Limit int
+}
+
 // WorkerStore 是 Worker 执行闭环所依赖的存储能力。
 //
 // 根包只通过这个接口做领取与确认，不直接书写 SQL；方言实现（如
@@ -118,6 +139,25 @@ type WorkerStore interface {
 	//
 	// 回收只改状态，绝不执行 Handler。
 	ReapExpiredLeases(ctx context.Context, limit int) (ReapResult, error)
+
+	// CleanupFinished 删除一批"已进入终态、且超过保留期"的任务，返回真正删除的行数。
+	//
+	// 契约有四条，都是实现必须守住的：
+	//
+	//  1. **只处理 spec.Status 指定的那一个终态**。pending / running 一行都不能碰，
+	//     它们是队列本身；被误删的任务既不会被执行，也不会留下任何痕迹。
+	//  2. 只删除 finished_at 早于"数据库当前时间 - spec.Retention"的行。终态但
+	//     finished_at 为 NULL 的行天然被排除（NULL 与任何值比较都不为真）——这是
+	//     刻意的兜底方向：宁可少删，也不要把"结束时间不明"的行当成过期。
+	//  3. 一批用**一个短事务**、且批内按主键删除，避免长事务与全表扫描；
+	//     加锁范围必须受 spec.Limit 约束（实现口径见 store/mysql）。
+	//  4. 删满 spec.Limit 行时返回的计数应当等于 Limit，调用方据此判断"可能还有
+	//     剩余"，不需要额外的 COUNT。
+	//
+	// 注意副作用：任务一旦被删除，它的幂等键就不再占用唯一索引，同一个键可以被
+	// 重新接受（技术设计 §3）。库保证的是"保留期内不重复入队"，不是"永不重复"；
+	// 需要更强语义的调用方要自己在业务侧去重。
+	CleanupFinished(ctx context.Context, spec CleanupSpec) (int64, error)
 }
 
 // Worker 从队列领取任务、调用 Handler、再把结果写回存储。
@@ -267,8 +307,8 @@ func (w *Worker) Run(ctx context.Context) error {
 		close(loopsDone)
 	}()
 
-	// 回收器的存亡只由 ctx 与配置决定，与在途 Handler 无关，所以单独一个信号。
-	// 关闭回收器时直接关掉它，下面的等待逻辑不必再分情况。
+	// 回收器与清理器的存亡只由 ctx 与配置决定，与在途 Handler 无关，所以各自一个
+	// 信号。关闭时直接关掉它，下面的等待逻辑不必再分情况。
 	reapDone := make(chan struct{})
 	if w.reaperEnabled() {
 		go func() {
@@ -279,6 +319,16 @@ func (w *Worker) Run(ctx context.Context) error {
 		close(reapDone)
 	}
 
+	cleanupDone := make(chan struct{})
+	if w.cleanupEnabled() {
+		go func() {
+			defer close(cleanupDone)
+			w.cleanupLoop(ctx)
+		}()
+	} else {
+		close(cleanupDone)
+	}
+
 	<-ctx.Done()
 
 	// 在途 Handler 拿到的 context 派生自 ctx，取消已经传到它们手里；这里只等
@@ -286,33 +336,48 @@ func (w *Worker) Run(ctx context.Context) error {
 	timer := time.NewTimer(w.cfg.ShutdownTimeout)
 	defer timer.Stop()
 
-	// 两个信号分开观察，只为把超时原因说清楚：是 Handler 没退，还是回收器没停。
-	// 置 nil 后该 case 永久阻塞，等同于"这一边已经不用再等了"。
-	handlersStopped, reaperStopped := false, false
-	for !handlersStopped || !reaperStopped {
+	// 三部分分开观察，只为把超时原因说清楚：是 Handler 没退，还是回收器/清理器
+	// 没停。置 nil 后该 case 永久阻塞，等同于"这一边已经不用再等了"。
+	handlersStopped, reaperStopped, cleanupStopped := false, false, false
+	for !handlersStopped || !reaperStopped || !cleanupStopped {
 		select {
 		case <-loopsDone:
 			handlersStopped, loopsDone = true, nil
 		case <-reapDone:
 			reaperStopped, reapDone = true, nil
+		case <-cleanupDone:
+			cleanupStopped, cleanupDone = true, nil
 		case <-timer.C:
-			return fmt.Errorf("%w: %s elapsed with %s",
-				ErrShutdownTimeout, w.cfg.ShutdownTimeout, stillRunning(handlersStopped, reaperStopped))
+			return fmt.Errorf("%w: %s elapsed with %s", ErrShutdownTimeout, w.cfg.ShutdownTimeout,
+				stillRunning(handlersStopped, reaperStopped, cleanupStopped))
 		}
 	}
 	return nil
 }
 
-// stillRunning 描述停机超时时还有哪一部分没停下来。
-func stillRunning(handlersStopped, reaperStopped bool) string {
-	switch {
-	case !handlersStopped && !reaperStopped:
-		return "handlers still running and the reaper not stopped"
-	case !handlersStopped:
-		return "handlers still running"
-	default:
-		return "the reaper not stopped"
+// stillRunning 描述停机超时时还有哪几部分没停下来。
+//
+// 三部分（执行循环 / 回收器 / 清理器）彼此独立，那句超时错误里唯一能定位问题的信息
+// 就是这段文字，所以逐项列出，而不是笼统一句"超时了"。
+func stillRunning(handlersStopped, reaperStopped, cleanupStopped bool) string {
+	var pending []string
+	if !handlersStopped {
+		pending = append(pending, "handlers still running")
 	}
+	if !reaperStopped {
+		pending = append(pending, "the reaper not stopped")
+	}
+	if !cleanupStopped {
+		pending = append(pending, "the cleanup not stopped")
+	}
+
+	// 连成一句英文清单："a" / "a and b" / "a, b and c"。进入等待循环时至少有一边
+	// 没停，所以 pending 不会是空的；空输入的返回（""）只是让这个函数保持全函数，
+	// 不至于在某次改动后把超时消息变成一次切片越界。
+	if len(pending) < 2 {
+		return strings.Join(pending, "")
+	}
+	return strings.Join(pending[:len(pending)-1], ", ") + " and " + pending[len(pending)-1]
 }
 
 // loop 是一个 goroutine 的领取循环。
@@ -516,6 +581,88 @@ func (w *Worker) reapLoop(ctx context.Context) {
 		// 计数暂时没有消费方：Worker 目前没有日志出口，§5「结构化日志」接进来
 		// 时这两个数会成为最有价值的一条。真库测试会直接断言它们。
 		_ = result
+	}
+}
+
+// cleanupMaxBatches 是一轮清理里、**每个终态**最多跑几批。
+//
+// 为什么要"一轮多批"：保留期清理要追上的是表的增长速度。若一轮只删一批，那么
+// "每小时删 1000 行"这种配置在每天新增几万行时永远追不上，积压只会单调增长——
+// 而积压恰恰是这个功能存在的理由。多批则让一轮有追赶能力，同时用一个明确的上限
+// 保证一轮不会无限期跑下去（每批各自一个短事务，见 store 侧实现）。
+//
+// 10 × CleanupBatchSize（默认 1000）＝ 一轮每个终态最多 1 万行。
+const cleanupMaxBatches = 10
+
+// cleanupEnabled 报告本 Worker 是否承担终态清理职责。
+//
+// 与回收器同一套约定：负值关闭，0 表示用默认值（NewWorker 会先跑 WithDefaults，
+// 因此走到这里 CleanupInterval 不可能是 0，Validate 也拒绝 0）。
+func (w *Worker) cleanupEnabled() bool {
+	return w.cfg.CleanupInterval > 0
+}
+
+// cleanupLoop 按 Config.CleanupInterval 周期删除超过保留期的终态任务，直到 ctx 取消。
+//
+// 与 reapLoop 遵循同一条原则：**只有 ctx 取消才退出**，驱动错误一律上报后等下一个
+// 周期重试——清理能力要是能被一次数据库抖动关掉，表就会一直长下去，而没人会注意到。
+//
+// 每个 tick 跑一轮；一轮里的批数有上限（cleanupMaxBatches），到点就等下个周期。
+func (w *Worker) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(w.cfg.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		w.runCleanupRound(ctx)
+	}
+}
+
+// runCleanupRound 对每个清理目标跑一轮：重复取批，直到某一批没删满（说明清干净了）
+// 或达到批数上限。
+//
+// "没删满即停"是这里唯一判断"还有没有剩余"的手段：CleanupSpec 的契约保证删满 limit
+// 说明后面很可能还有，因此不需要额外的 COUNT；反过来，没删满就继续问下去只会多一次
+// 空查询。
+//
+// 单个目标失败**不影响其他目标**：三种终态的保留期彼此独立，让 succeeded 的一次
+// 抖动顺带把 dead 的清理也停掉没有道理。
+func (w *Worker) runCleanupRound(ctx context.Context) {
+	for _, spec := range w.cleanupSpecs() {
+		for i := 0; i < cleanupMaxBatches; i++ {
+			deleted, err := w.store.CleanupFinished(ctx, spec)
+			if err != nil {
+				// ctx 取消导致的失败是停机的附带结果，不是基础设施故障，不必上报。
+				if ctx.Err() != nil {
+					return
+				}
+				w.report(fmt.Errorf("cleanup %s tasks: %w", spec.Status, err))
+				break
+			}
+			if deleted < int64(spec.Limit) {
+				break
+			}
+		}
+	}
+}
+
+// cleanupSpecs 返回本 Worker 一轮清理要处理的目标。
+//
+// succeeded 与 canceled 共用 Config.SucceededRetention，dead 用 DeadRetention
+// （技术设计 §5.7）。做成一次一个终态而不是一个 `status IN (...)`：等值前缀才能让
+// 加锁读停在 (status, finished_at, id) 索引上、并保持 (finished_at, id) 有序
+// ——换成 IN，优化器会退化成范围扫描 + filesort，加锁范围就不再受 LIMIT 约束。
+// 理由与实测见 CleanupSpec 的注释与技术设计附录 A。
+func (w *Worker) cleanupSpecs() []CleanupSpec {
+	return []CleanupSpec{
+		{Status: StatusSucceeded, Retention: w.cfg.SucceededRetention, Limit: w.cfg.CleanupBatchSize},
+		{Status: StatusCanceled, Retention: w.cfg.SucceededRetention, Limit: w.cfg.CleanupBatchSize},
+		{Status: StatusDead, Retention: w.cfg.DeadRetention, Limit: w.cfg.CleanupBatchSize},
 	}
 }
 

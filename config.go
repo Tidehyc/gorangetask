@@ -132,7 +132,16 @@ type Config struct {
 	// CleanupBatchSize 是每轮清理最多删除的行数，必须大于 0。
 	CleanupBatchSize int
 
-	// CleanupInterval 是清理任务的运行间隔，必须大于 0。
+	// CleanupInterval 是终态任务清理器的运行间隔，不得为 0。
+	//
+	// 清理器按保留期删除 succeeded / canceled / dead 三类终态任务（技术设计
+	// §5.7）。这些行只是执行记录，留着只会让表无限增长、拖慢索引与领取扫描。
+	// 一"轮"最多跑固定批数，每批各用一个独立事务，避免长事务。
+	//
+	// **负值表示关闭清理器**：该 Worker 不承担清理职责，终态任务不再被删除，
+	// 表会持续增长，需要外部运维手段（定时 SQL）接手。0 会被 WithDefaults 填成
+	// DefaultCleanupInterval，因此"不设置"与"关闭"是两个不同的表达——语义与
+	// ReapInterval 保持一致。
 	CleanupInterval time.Duration
 }
 
@@ -272,8 +281,9 @@ func (c Config) Validate() error {
 	if c.CleanupBatchSize <= 0 {
 		errs = append(errs, fmt.Errorf("cleanup batch size must be > 0, got %d", c.CleanupBatchSize))
 	}
-	if c.CleanupInterval <= 0 {
-		errs = append(errs, fmt.Errorf("cleanup interval must be > 0, got %s", c.CleanupInterval))
+	// 清理器与回收器共用同一套开关约定：0 是"未设置"，负值是关闭开关。
+	if c.CleanupInterval == 0 {
+		errs = append(errs, errors.New("cleanup interval must not be 0 (use a negative value to disable the cleanup)"))
 	}
 
 	if len(errs) == 0 {

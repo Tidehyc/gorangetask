@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -176,6 +177,37 @@ const (
         last_error = ?, updated_at = UTC_TIMESTAMP(6)
     WHERE id = ? AND status = 'running' AND lease_until = ?`
 )
+
+// cleanupIDsSQL 选出"已进入终态、且超过保留期"的行 id。
+//
+// 走 ix_gotask_cleanup (status, finished_at, id)，**而且不需要 FORCE INDEX**——
+// 与回收器（§5.6）的差别正在这里：这条读只取 id，三列全在索引里，是天然的覆盖
+// 索引，优化器没有理由离开它。（回收器那条要连带取 attempt / max_attempts，
+// 才必须把计划钉死。）
+//
+// status 用**等值**而不是 `IN (...)`，也是刻意的：等值前缀让索引的后两列
+// (finished_at, id) 继续保证有序，ORDER BY 与 LIMIT 都吃索引顺序、没有 filesort；
+// 换成 IN，各段之间无法保序，优化器会退化成范围扫描 + filesort，加锁范围就不再受
+// LIMIT 约束（同类事故的完整记录见技术设计附录 A）。这也是 CleanupSpec 做成
+// "一次一个终态"的原因。
+//
+// 时间边界用**数据库时钟**减去保留期；负号放在 Go 侧传进来，SQL 保持
+// TIMESTAMPADD 的统一写法。
+//
+// `finished_at <= ...` 顺带把 finished_at IS NULL 的行排除掉了（NULL 与任何值比较
+// 都不为真）。终态行不该出现 NULL，但兜底方向是"宁可少删"。
+const cleanupIDsSQL = `SELECT id FROM ` + tasksTable + `
+    WHERE status = ?
+      AND finished_at <= TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6))
+    ORDER BY finished_at, id
+    LIMIT ?
+    FOR UPDATE SKIP LOCKED`
+
+// deleteTasksByIDPrefix 按主键删除，主键列表由调用方拼成等量占位符。
+//
+// 删除条件只用主键、不重复一遍筛选条件：选中的 id 就是"刚刚确认过期的行"，按主键删
+// 既不会误删别的行，也不会因为期间有人改了 finished_at 而漏删。
+const deleteTasksByIDPrefix = `DELETE FROM ` + tasksTable + ` WHERE id IN (`
 
 // Claim 原子领取一批到期任务，实现 gorangetask.WorkerStore。
 //
@@ -564,4 +596,118 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string([]rune(s)[:n])
+}
+
+// CleanupFinished 删除一批超过保留期的终态任务，实现 gorangetask.WorkerStore。
+//
+// 与回收器同构：一个短事务里"加锁读选出 id → 按主键删除 → 提交"，事务期间不做任何
+// 别的事。选行用 SKIP LOCKED，集群里多个 Worker 各跑各的清理器时彼此跳过已锁定的行；
+// 删除只按主键，因此批内不会出现"筛选中途条件变了"的情况。
+//
+// 返回的是**真正删除**的行数（RowsAffected，而不是"选出了几行"）：调用方用
+// "是否删满 limit"判断还有没有剩余，所以不需要额外的 COUNT。
+//
+// 只删 spec.Status 指定的那一个终态：pending / running 一行都不碰，它们是队列本身。
+func (c *Client) CleanupFinished(ctx context.Context, spec gorangetask.CleanupSpec) (int64, error) {
+	if err := validateCleanupSpec(spec); err != nil {
+		return 0, err
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("gorangetask/store/mysql: begin cleanup transaction: %w", err)
+	}
+	// 提交成功后 Rollback 返回 sql.ErrTxDone，是可忽略的常规行为。
+	defer func() { _ = tx.Rollback() }()
+
+	ids, err := selectCleanupIDs(ctx, tx, spec)
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	deleted, err := deleteTasksByID(ctx, tx, ids)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("gorangetask/store/mysql: commit cleanup transaction: %w", err)
+	}
+	return deleted, nil
+}
+
+// selectCleanupIDs 执行加锁读并收集待删除的 id。
+//
+// 返回前必须把 rows 关掉：同一条事务连接上未读完的结果集会挡住后面的 DELETE。
+func selectCleanupIDs(ctx context.Context, tx *sql.Tx, spec gorangetask.CleanupSpec) ([]int64, error) {
+	// 保留期取负：cleanupIDsSQL 统一用 TIMESTAMPADD(..., ?, UTC_TIMESTAMP(6))，
+	// 要往前推就得传负数。
+	retentionMicros := -spec.Retention.Microseconds()
+
+	rows, err := tx.QueryContext(ctx, cleanupIDsSQL, string(spec.Status), retentionMicros, spec.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: select cleanup candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("gorangetask/store/mysql: scan cleanup candidate: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: read cleanup candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: close cleanup candidate rows: %w", err)
+	}
+	return ids, nil
+}
+
+// deleteTasksByID 按主键删除给定的 id，返回真正删除的行数。
+//
+// 行数上限由 MySQL 的 max_allowed_packet 与占位符数量共同约束，而调用方的 limit 是
+// 可配置的；这里不额外设上限，是因为批大小本来就该由使用方按自己的行宽与包大小去定
+// （默认 1000 个占位符远在限额之内）。
+func deleteTasksByID(ctx context.Context, tx *sql.Tx, ids []int64) (int64, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+
+	res, err := tx.ExecContext(ctx, deleteTasksByIDPrefix+placeholders+")", args...)
+	if err != nil {
+		return 0, fmt.Errorf("gorangetask/store/mysql: delete %d finished task(s): %w", len(ids), err)
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("gorangetask/store/mysql: read deleted rows: %w", err)
+	}
+	return deleted, nil
+}
+
+// validateCleanupSpec 校验清理入参。
+//
+// **状态必须是终态**：这不是"顺手校验"，而是这条语句唯一的防误删屏障——它一旦放行
+// pending / running，被删掉的任务既不会被执行，也不会留下任何痕迹。
+func validateCleanupSpec(spec gorangetask.CleanupSpec) error {
+	if !spec.Status.IsTerminal() {
+		return fmt.Errorf("%w: cleanup status must be terminal, got %q",
+			gorangetask.ErrInvalidConfig, spec.Status)
+	}
+	if spec.Retention <= 0 {
+		return fmt.Errorf("%w: cleanup retention must be > 0, got %s",
+			gorangetask.ErrInvalidConfig, spec.Retention)
+	}
+	if spec.Limit < 1 {
+		return fmt.Errorf("%w: cleanup limit must be > 0, got %d", gorangetask.ErrInvalidConfig, spec.Limit)
+	}
+	return nil
 }
