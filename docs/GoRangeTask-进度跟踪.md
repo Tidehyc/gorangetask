@@ -70,7 +70,9 @@
 
 > 集成测试的库隔离：`go test ./...` 会并发运行不同的包，而集成测试的 setup 是破坏性的（`DROP TABLE` + 重新迁移）。因此 `store/mysql` 使用派生库 `<DSN 库名>_store` 并自动创建，避免与 `migrations/mysql` 的集成测试互相删表而报出与产品无关的假失败（`ErrDirty`、`Error 1050 Table already exists`）。新增集成测试包时应取一个独立后缀。
 >
-> ⚠️ 本地环境需要**两个**库：`migrations/mysql` 直接使用 DSN 里的 `gotask_test`，而它**不会自己创建**该库；`store/mysql` 的 `gotask_test_store` 则由测试自动创建。`scripts/dev-mysql.sh up` 目前只建 `gotask`，因此数据卷被删过之后必须手工补：`docker exec gotask-mysql mysql -uroot -prootpw --protocol=TCP -e "CREATE DATABASE IF NOT EXISTS gotask_test CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"`。否则迁移集成测试会以 `Error 1049 Unknown database 'gotask_test'` 整包失败（2026-10-15 实际踩到）。
+> 测试库口径（2026-10-15 调整）：**不再区分「开发库」与「测试库」，统一用 `gotask` 一个库**。DSN 写成 `.../gotask?...`；`scripts/dev-mysql.sh up` 已经会创建它，CI 由 service container 的 `MYSQL_DATABASE` 预设，两条路径都不需要任何手工步骤。`migrations/mysql` 直接使用该库（它自己不建库，只对表做 DDL），`store/mysql` 使用自动派生的 `gotask_store`。原先的 `gotask_test` 已废弃删除。
+>
+> ⚠️ 顺带记下这个坑的成因：`gotask_test` 当年只是某次手工建好后才一直留在数据卷 `gotask-mysql-data` 里，卷被删掉后没有任何环节会重建它，于是 `migrations/mysql` 整包以 `Error 1049 Unknown database 'gotask_test'` 失败（2026-10-15 实际踩到）。该报错来自夹具的 `PingContext`、**不是迁移失败**——`sql.Open` 是惰性的，此时一条迁移语句都没跑，所以别把这类报错当成迁移逻辑的问题。
 
 ## 3. Worker 执行闭环
 
@@ -124,6 +126,6 @@
 
 已确认的工程约定：module path `github.com/Tidehyc/gorangetask`（gh 账号 `Tidehyc`）、最低 Go 1.24、许可证 MIT、提交以需求为粒度、每次开工前先确认范围。
 
-本地开发库：容器化 MySQL 8.0.46（`gotask-mysql`，`127.0.0.1:3306`，库 `gotask`/`root`/`rootpw`），用 `scripts/dev-mysql.sh up|down|reset|status|shell` 管理。集成测试另需 `gotask_test` 库（迁移测试不会自建，`dev-mysql.sh up` 也不建，需手工补——见上文「集成测试的库隔离」下的提示）。
+本地开发库：容器化 MySQL（`gotask-mysql`，`127.0.0.1:3306`，库 `gotask`/`root`/`rootpw`），用 `scripts/dev-mysql.sh up|down|reset|status|shell` 管理。集成测试复用同一个 `gotask` 库（`up` 已建），`store/mysql` 会自动创建派生库 `gotask_store`——见上文「集成测试的库隔离」下的说明，不需要手工建任何库。
 
 阶段完成后更新本表状态，并补上测试命令、结果、commit 或基准文件路径。不要把“代码已写”直接记作“已验收”。
