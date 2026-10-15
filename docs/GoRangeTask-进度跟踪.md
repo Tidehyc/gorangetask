@@ -2,7 +2,7 @@
 
 > 用途：对照需求和技术设计追踪项目完成情况；每项完成后补充提交、测试日志、基准结果或文档链接作为证据。
 > 当前状态：构建阶段
-> 更新日期：2026-10-13
+> 更新日期：2026-10-15
 > 核心依据：[GoRangeTask-需求文档.md](./GoRangeTask-需求文档.md)、[GoRangeTask-技术设计.md](./GoRangeTask-技术设计.md)、[GoRangeTask-STAR.md](./GoRangeTask-STAR.md)
 
 ## 项目身份
@@ -64,7 +64,13 @@
 
 测试口径（2026-10-13）：根包 **27 个 Worker 单测**（内存假 store，不连库；含「Handler 内栅栏」用例证明并发池确有 N 个同时运行、4 个优雅停机用例，以及逐任务超时覆盖/回落两个子用例，根包覆盖率 100%）与 `store/mysql` **26 个 Worker 真库集成用例**（到期/队列/limit/顺序/不重复领取、epoch 与 attempt 递增、claim 走 `ix_gotask_claim` 且 `Using index`、三种写回的正常与 fencing 拒绝、延迟与 `last_error` 截断、三个端到端、**并发领取**三件套：8 领取者抢 40 条、跨会话 `SKIP LOCKED` 跳过被锁行、4 Worker 每条恰好执行一次、**停机后任务留在 running** 的库侧状态断言，以及**领取还原逐任务超时**的往返）。全量 `go test -race -count=1 ./...`：**254 条用例记录（128 顶层 + 126 子用例）、0 FAIL、0 SKIP、无 data race**；`store/mysql` 语句覆盖率 93.1%（未覆盖的是驱动层报错分支，如 `BeginTx`/`Exec`/`RowsAffected` 自身失败，无法在真实驱动上构造）。
 
+测试口径（2026-10-15）：根包新增 **5 个租约用例 + 1 个停机续租守卫用例**，并给 2 个既有用例补上取消原因断言；`store/mysql` 新增 **3 个真库用例（共 8 个子用例）+ 1 个入参校验单测**。全量 `go test -race -count=1 ./...`：**272 条记录（136 顶层 + 136 子用例）、0 FAIL、0 SKIP、无 data race**；三个包全绿，根包语句覆盖率 **100%**、`store/mysql` 93.1%。
+
+> **新断言的证伪检查（2026-10-15 做的 5 条）**：短路失租分支、失租后不取消 Handler、把续租的驱动错误当失租、写回前不等看护退出、停掉续租——五处都确认"故意破坏实现时用例立即失败"，再还原并 `diff` 校验与备份逐字节一致。凡断言依赖某个非显然的实现选择，都照这个流程走一遍。
+
 > 集成测试的库隔离：`go test ./...` 会并发运行不同的包，而集成测试的 setup 是破坏性的（`DROP TABLE` + 重新迁移）。因此 `store/mysql` 使用派生库 `<DSN 库名>_store` 并自动创建，避免与 `migrations/mysql` 的集成测试互相删表而报出与产品无关的假失败（`ErrDirty`、`Error 1050 Table already exists`）。新增集成测试包时应取一个独立后缀。
+>
+> ⚠️ 本地环境需要**两个**库：`migrations/mysql` 直接使用 DSN 里的 `gotask_test`，而它**不会自己创建**该库；`store/mysql` 的 `gotask_test_store` 则由测试自动创建。`scripts/dev-mysql.sh up` 目前只建 `gotask`，因此数据卷被删过之后必须手工补：`docker exec gotask-mysql mysql -uroot -prootpw --protocol=TCP -e "CREATE DATABASE IF NOT EXISTS gotask_test CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"`。否则迁移集成测试会以 `Error 1049 Unknown database 'gotask_test'` 整包失败（2026-10-15 实际踩到）。
 
 ## 3. Worker 执行闭环
 
@@ -80,10 +86,10 @@
 
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
-| [ ] | 租约续期 | DB 时间为准；有效 owner/epoch 可续期；失租 RowsAffected=0 | 待实现 |
-| [ ] | lease 丢失取消 context | heartbeat 发现失租后取消 handler context | 待实现 |
-| [ ] | 过期租约回收 | 未耗尽次数回 pending；耗尽次数进入 dead | 待实现 |
-| [ ] | fencing 状态写回 | 旧 epoch 无法续租、成功确认或失败确认 | 待实现 |
+| [x] | 租约续期 | DB 时间为准；有效 owner/epoch 可续期；失租 RowsAffected=0 | 2026-10-15 提交 `7d09e27`：`store/mysql` 新增 `renewLeaseSQL` + `RenewLease`（`lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6))`，**从数据库当前时间起算、不在旧值上累加**——累加会让租约随续租次数越推越远，一次失败的续租就能把任务锁住远超预期；`WHERE` 与三条写回完全一致，含 `status='running'`，否则失去租约的旧 Worker 能靠续租把自己"续"回有效状态）；`WorkerStore` 接口新增该方法；根包 `Worker` 为每条在途任务起一个租约看护协程，按 `Config.HeartbeatInterval`（默认 10s = 租约的 1/3）续租，单次续租自带一个心跳周期的超时预算，避免数据库卡住时看护协程无限期阻塞。真库用例 `TestRenewLeaseExtendsLeaseUntilFromDatabaseClock`：区间断言把"在旧 `lease_until` 上累加"的实现排除掉（两种算法结果相差整整一个原始租约长度），并断言 epoch/attempt/owner/status 一律不变；端到端 `TestWorkerRenewsLeaseSoHandlerCanOutliveOneLease`：Handler 轮询数据库直到**亲眼看到**租约被延到比初始更晚、且数据库时钟已越过初始到期时间才返回，最终写回成功、`attempt`/`lease_epoch` 均为 1。**证伪检查**：停掉续租后该用例 25s 后失败，任务停在 `running`——正是 §3 遗留的缺口 |
+| [x] | lease 丢失取消 context | heartbeat 发现失租后取消 handler context | 2026-10-15 提交 `7d09e27`：`process` 改用 `context.WithCancelCause` 把**三种取消原因**分开——停机（`context.Canceled`）、逐任务超时（`context.DeadlineExceeded`）、失去租约（`ErrLeaseLost`）；Handler 可用 `context.Cause` 分辨自己是被谁叫停的，Worker 据原因决定要不要写回（详见技术设计 §5.3.1）。看护确认失租即 `cancelTask` 取消 Handler，任务保持 `running`。**续租失败 ≠ 失租**：只有 `ErrLeaseLost` 才办这件事，连接断开/语句超时一类驱动错误只上报并在下个心跳周期重试（需求文档 §9），否则一次数据库抖动会掐掉所有在途 Handler。用例：`TestWorkerCancelsHandlerWhenLeaseIsLost`（Handler 看到的原因包着 `ErrLeaseLost`，且 succeeded/retried/dead **零写回**）、`TestWorkerKeepsRunningWhenRenewFailsWithInfrastructureError`（连续两次驱动错误后 Handler 仍正常跑完并被成功确认）、`TestWorkerDoesNotReportRenewalsCutShortByShutdown`（停机打断的续租既不算失租也不上报成续租失败）。既有停机用例补上原因断言：`context.Cause` 是 `context.Canceled` 且**不是** `ErrLeaseLost` |
+| [ ] | 过期租约回收 | 未耗尽次数回 pending；耗尽次数进入 dead | 待实现（§4 下一项） |
+| [x] | fencing 状态写回 | 旧 epoch 无法续租、成功确认或失败确认 | 本行拆成两半，两侧均有真库证据。**成功/失败确认**在 §3 已完成：`succeedTaskSQL`/`retryTaskSQL`/`markDeadTaskSQL` 共用 `(id, status='running', owner, epoch, lease_until 未过期)` 四重条件，§3 已有正常路径与拒绝路径的真库用例。**续租一侧**由 2026-10-15 提交 `7d09e27` 补齐：`TestRenewLeaseRejectsStaleCredentialsAndExpiredLease` 五个子用例覆盖旧 owner、旧 epoch、已过期租约、已是终态（不能被续租复活）、任务不存在，全部返回 `ErrLeaseLost` 且**库里零痕迹**（`lease_until` 未被改动）。另有 `TestRenewLeaseRejectsInvalidInput` 覆盖入参校验（零 ID、空 owner、零/负租约时长） |
 | [ ] | 重试退避与永久错误 | full-jitter 指数退避、上限、永久错误及次数耗尽状态正确 | 待实现 |
 | [ ] | panic 处理 | 单任务 panic 转失败；Worker 不因可恢复 panic 崩溃 | 待实现 |
 | [ ] | 终态清理 | succeeded/dead/canceled 按保留期小批量清理 | 待实现 |
@@ -102,22 +108,22 @@
 
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
-| [ ] | MySQL 集成测试 | 事务、锁、租约和索引语义用真实 MySQL 验证 | 待实现 |
-| [ ] | 并发正确性测试 | N 个 worker 并发处理 M 个任务，同租约期每项至多一位有效持有者 | 待实现 |
-| [ ] | 故障注入：claim 后退出 | 租约过期后任务能重新执行并最终完成 | 待实现 |
-| [ ] | 故障注入：副作用后 ack 前退出 | 允许重复执行，幂等示例最终效果正确 | 待实现 |
-| [ ] | 故障注入：旧 worker 复苏 | fencing 拒绝过期 worker 写回 | 待实现 |
-| [ ] | Race 检查 | `go test -race` 覆盖 worker 内部并发路径 | 待实现 |
+| [x] | MySQL 集成测试 | 事务、锁、租约和索引语义用真实 MySQL 验证 | 四类语义都已在 MySQL 8.0.46 上验证过（细节见 §2/§3/§4 各行证据）：**事务**——`EnqueueTx` 的提交可见/回滚无痕；**锁**——`FOR UPDATE SKIP LOCKED` 跨会话跳过被锁行（`TestClaimSkipsRowsLockedByAnotherSession`，另会话持有行锁时 Claim 不阻塞且跳过它）；**租约**——claim 置租约与 epoch、续租按数据库时钟延长、失租/过期/易主一律 `ErrLeaseLost`、停机保持 running；**索引**——claim 走 `ix_gotask_claim` 且 `Using index`（`EXPLAIN` 断言）。集成测试**不以 mock 替代**：内存假 store 只用于根包的分支覆盖。 |
+| [x] | 并发正确性测试 | N 个 worker 并发处理 M 个任务，同租约期每项至多一位有效持有者 | §3「多 Worker 并发领取」三件套已覆盖（提交 `454ccac`）：8 领取者同一栅栏后抢 40 条（两层断言：进程侧 id 不重不漏 + **库侧 `lease_epoch`/`attempt` 全为 1** 的独立复核）、跨会话 `SKIP LOCKED` 跳过被锁行、4 Worker（各 2 并发）跑 24 条且每条 Handler **恰好执行 1 次**。真库上还顺带排除"租约过期被重领"这一混淆因素（领取用 `LeaseDuration = time.Minute`）。 |
+| [ ] | 故障注入：claim 后退出 | 租约过期后任务能重新执行并最终完成 | 待实现——**卡在回收器上**：停机用例已断言"任务留在 running 且租约仍在"（`ShutdownLeavesCancelledTaskRunningForTheReaper`），但没有组件会去捡它，因此"最终完成"这半句现在无法验证。§4「过期租约回收」落地后可补。 |
+| [ ] | 故障注入：副作用后 ack 前退出 | 允许重复执行，幂等示例最终效果正确 | 待实现（依赖示例服务） |
+| [ ] | 故障注入：旧 worker 复苏 | fencing 拒绝过期 worker 写回 | 待实现——机制侧已有等价证据：§3 三条写回与 2026-10-15 的续租都用**陈旧 owner/epoch、已过期租约**直接验证了 `ErrLeaseLost` 且库里零痕迹。缺的是"让一个旧 Worker 延迟苏醒再真的尝试写回"的端到端场景，等示例服务再补。 |
+| [x] | Race 检查 | `go test -race` 覆盖 worker 内部并发路径 | 全量 `go test -race -count=1 ./...` 三个包全绿、日志中 **0 处 `DATA RACE`**（2026-10-15 复跑：272 条记录、0 FAIL、0 SKIP）。worker 内部并发路径（并发领取池、每条任务一个租约看护协程、停机与失租同时取消）都在 `-race` 下跑过。 |
 | [ ] | 性能基线 | 记录硬件/DB/配置、吞吐、排队延迟、API/DB成本 | 待实现 |
-| [ ] | README 与语义说明 | 安装、使用、事务入队、至少一次、幂等、恢复和限制齐全 | 待实现 |
-| [ ] | STAR 指标回填 | 只写实测数值，并保留命令、环境和原始结果 | 待实现 |
+| [ ] | README 与语义说明 | 安装、使用、事务入队、至少一次、幂等、恢复和限制齐全 | 进行中——**语义部分已齐**（项目定位、执行语义与边界、至少一次与幂等、fencing 保护范围、本地环境、文档索引，2026-10-15 已把自相矛盾的状态段改成分「已可用/尚未实现」）；**缺**安装与使用示例、`go get` 与最小可运行代码、故障恢复演示（这两项依赖示例服务）。 |
+| [ ] | STAR 指标回填 | 只写实测数值，并保留命令、环境和原始结果 | 待实现（依赖性能基线） |
 
-## 当前可开工项与待用户提供信息
+## 当前可开工项
 
-技术方案已足以开始仓库骨架、migration 和核心 API 设计。已确认：module path `github.com/Tidehyc/gorangetask`（gh 账号 `Tidehyc` 已复核有效）、最低 Go 1.24、许可证 MIT。
+§0–§3 全部完成，§4 完成 3/7（租约续期、失租取消 context、fencing 状态写回）。**下一项是 §4「过期租约回收」**——它同时是 §3 留下的缺口的闭合点：停机超时、进程崩溃、失租遗留的 `running` 任务目前只能一直等下去，因为还没有任何组件会去捡它们（已在 README 与 §6「故障注入：claim 后退出」处标注）。
 
-本地开发库已就绪：容器化 MySQL 8.0.46（`gotask-mysql`，卷 `gotask-mysql-data`，`127.0.0.1:3306`，库 `gotask`/`root`/`rootpw`），用 `scripts/dev-mysql.sh up|down|reset|status|shell` 管理；集成测试可指向该实例，或后续用 Testcontainers 自建容器（Docker 守护进程已运行，可用）。
+已确认的工程约定：module path `github.com/Tidehyc/gorangetask`（gh 账号 `Tidehyc`）、最低 Go 1.24、许可证 MIT、提交以需求为粒度、每次开工前先确认范围。
 
-下一步：本地 `git init`（main 分支）→ 首个提交为项目骨架（README、LICENSE、go.mod、.gitignore，保留 `docs/`）→ 再 `gh repo create Tidehyc/gorangetask` 建远程并推送。
+本地开发库：容器化 MySQL 8.0.46（`gotask-mysql`，`127.0.0.1:3306`，库 `gotask`/`root`/`rootpw`），用 `scripts/dev-mysql.sh up|down|reset|status|shell` 管理。集成测试另需 `gotask_test` 库（迁移测试不会自建，`dev-mysql.sh up` 也不建，需手工补——见上文「集成测试的库隔离」下的提示）。
 
-开始实现后，每次阶段完成时更新本表状态，并补上测试命令、结果、commit 或基准文件路径。不要把“代码已写”直接记作“已验收”。
+阶段完成后更新本表状态，并补上测试命令、结果、commit 或基准文件路径。不要把“代码已写”直接记作“已验收”。

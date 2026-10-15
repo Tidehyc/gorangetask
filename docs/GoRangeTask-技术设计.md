@@ -165,6 +165,22 @@ WHERE id = ?
 
 RowsAffected 为 0 表示租约已丢失或到期。Worker 必须立即 cancel Handler context，禁止该次执行进行状态确认。context cancel 是协作式通知，不会回滚已经发生的业务副作用。
 
+**新的 `lease_until` 从数据库当前时间起算，不在旧的 `lease_until` 上累加**：续租表达的是"从我续租的这一刻起，再保证这么长时间"；累加会让租约随续租次数越推越远，一次失败的续租就能把任务锁住远超预期的时间。续租同样要匹配 `status = 'running'`——否则一个已经失去租约的旧 Worker 可以靠续租把自己"续"回有效状态，fencing 就形同虚设；终态任务也不能被续租复活。
+
+### 5.3.1 本次执行的三种取消原因（2026-10-15 定）
+
+Worker 传给 Handler 的 context 会因三种互不相同的原因被取消。Handler 可用 `context.Cause` 分辨自己是被谁叫停的，Worker 则据原因决定"要不要写回"：
+
+| 原因 | `context.Cause` | Worker 的处理 |
+|---|---|---|
+| 停机（`Run` 的 ctx 被取消） | `context.Canceled` | 停止续租但**不释放租约**；失败不写回，成功仍确认 |
+| 逐任务超时（`Task.Timeout`，未设置则用 `HandlerTimeout`） | `context.DeadlineExceeded` | 普通任务失败，走重试/死信 |
+| 失去租约（续租影响 0 行） | `ErrLeaseLost` | **任何状态都不写回**，任务保持 `running` 交给回收器 |
+
+**续租失败不等于失租。** 只有 `ErrLeaseLost` 才说明租约没了；连接断开、语句超时这类驱动错误只说明"这次没问成"，租约可能仍然有效，因此只上报并在下一个心跳周期重试，**绝不据此取消 Handler**（需求文档 §9「数据库暂时不可用时记录错误、退避并继续」）。若数据库长时间不可用，租约会自然过期，届时下一次续租才会返回 `ErrLeaseLost`。
+
+顺序上，Worker 必须**先停掉这条任务的租约看护、等它退出，再写回状态**。反过来的话，续租会在任务已经写成终态之后到达，因 `status` 不再是 `running` 而返回 `ErrLeaseLost`，把一个已经正常结束的任务凭空报成"失租"。
+
 ### 5.4 成功确认
 
 ```sql
