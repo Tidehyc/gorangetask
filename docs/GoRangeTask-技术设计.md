@@ -245,6 +245,17 @@ Reaper 按小批次处理 `running AND lease_until <= UTC_TIMESTAMP(6)`：事务
 
 Cleanup 以小批次选取 `succeeded` 且 `finished_at < UTC_TIMESTAMP(6) - 7 DAY`，以及 `dead` 且超过 30 天的行；按主键删除，避免长事务。保留期可配置。`canceled` 默认按成功任务保留期处理。任务被删除后，其幂等键不再占用唯一键。
 
+**实现口径（2026-10-15 落地时补齐）**
+
+- **一次调用只清一个终态**（`CleanupSpec{Status, Retention, Limit}`），保留期随状态一起传入，而不是写死在 SQL 里。这样做不是为了接口好看：`status` 必须是**等值**谓词，索引 `ix_gotask_cleanup (status, finished_at, id)` 的等值前缀才能让后两列继续有序，`ORDER BY finished_at, id` 与 `LIMIT` 才吃得上索引顺序（没有 filesort）。一旦写成 `status IN ('succeeded','canceled')`，各段之间无法保序，优化器退化为范围扫描 + filesort，`FOR UPDATE` 的加锁范围就不再受 `LIMIT` 约束——这正是附录 A 记的那类事故。
+- **这条加锁读只 `SELECT id`**，三列全在 `ix_gotask_cleanup` 里，是天然的覆盖索引，因此**不加 `FORCE INDEX`**。这是它与 §5.6 回收器那条读的关键差别：回收器要连带取 `attempt` / `max_attempts`，覆盖索引不成立，只能显式把计划钉在 lease 索引上。两条读都各有一条 `EXPLAIN` 回归用例。
+- 边界用 `finished_at <= UTC_TIMESTAMP(6) - Retention`（原稿写 `<`，实现在微秒精度上用 `<=`，二者只在恰好等于边界的那个微秒上有差异）。写成 `<=` 顺带排除了 `finished_at IS NULL` 的行（NULL 与任何值比较都不为真）——终态行不该出现 NULL，但兜底方向刻意取"宁可少删"。
+- 删除按主键（先选 id 再 `DELETE ... WHERE id IN (...)`），一个短事务一批；返回的是 `RowsAffected`（**真正删了几行**，不是选出了几行），调用方据此判断"是否删满、可能还有剩余"，不需要额外的 `COUNT`。
+- **一轮里每个终态最多跑 10 批**（`cleanupMaxBatches`）。一轮只删一批的话，"每小时删 1000 行"这种配置在每天新增几万行时永远追不上，积压单调增长——而那正是这个功能存在的理由；上限则保证一轮有确定的时长，不会把 Worker 一直占住。
+- **单个终态失败不影响其余两个**：三种保留期彼此独立，`succeeded` 的一次抖动没有理由顺带把 `dead` 的清理也停掉。
+- 运行间隔 `CleanupInterval`（默认 1h）与回收器同一套约定：**负值关闭清理器**，0 由 `WithDefaults` 填成默认值、`Validate` 拒绝。
+- 入参校验（状态必须终态、保留期 > 0、批大小 ≥ 1）**先于任何读与写**：非终态校验是这条语句唯一的防误删屏障，一旦放行 `pending` / `running`，被删掉的任务既不会被执行也不会留下痕迹。
+
 ### 5.8 状态查询与取消
 
 状态查询只读需要的列，不 `SELECT *`；`lease_owner` / `lease_until` / `lease_epoch` 属于 Worker 内部状态，不进 `TaskInfo`，免得以后加列时无意中暴露内部字段。返回的时间字段一律换算为 UTC，不依赖调用方 DSN 里的 `loc` 设置。
