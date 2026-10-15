@@ -90,7 +90,7 @@
 |---|---|---|---|
 | [x] | 租约续期 | DB 时间为准；有效 owner/epoch 可续期；失租 RowsAffected=0 | 2026-10-15 提交 `7d09e27`：`store/mysql` 新增 `renewLeaseSQL` + `RenewLease`（`lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6))`，**从数据库当前时间起算、不在旧值上累加**——累加会让租约随续租次数越推越远，一次失败的续租就能把任务锁住远超预期；`WHERE` 与三条写回完全一致，含 `status='running'`，否则失去租约的旧 Worker 能靠续租把自己"续"回有效状态）；`WorkerStore` 接口新增该方法；根包 `Worker` 为每条在途任务起一个租约看护协程，按 `Config.HeartbeatInterval`（默认 10s = 租约的 1/3）续租，单次续租自带一个心跳周期的超时预算，避免数据库卡住时看护协程无限期阻塞。真库用例 `TestRenewLeaseExtendsLeaseUntilFromDatabaseClock`：区间断言把"在旧 `lease_until` 上累加"的实现排除掉（两种算法结果相差整整一个原始租约长度），并断言 epoch/attempt/owner/status 一律不变；端到端 `TestWorkerRenewsLeaseSoHandlerCanOutliveOneLease`：Handler 轮询数据库直到**亲眼看到**租约被延到比初始更晚、且数据库时钟已越过初始到期时间才返回，最终写回成功、`attempt`/`lease_epoch` 均为 1。**证伪检查**：停掉续租后该用例 25s 后失败，任务停在 `running`——正是 §3 遗留的缺口 |
 | [x] | lease 丢失取消 context | heartbeat 发现失租后取消 handler context | 2026-10-15 提交 `7d09e27`：`process` 改用 `context.WithCancelCause` 把**三种取消原因**分开——停机（`context.Canceled`）、逐任务超时（`context.DeadlineExceeded`）、失去租约（`ErrLeaseLost`）；Handler 可用 `context.Cause` 分辨自己是被谁叫停的，Worker 据原因决定要不要写回（详见技术设计 §5.3.1）。看护确认失租即 `cancelTask` 取消 Handler，任务保持 `running`。**续租失败 ≠ 失租**：只有 `ErrLeaseLost` 才办这件事，连接断开/语句超时一类驱动错误只上报并在下个心跳周期重试（需求文档 §9），否则一次数据库抖动会掐掉所有在途 Handler。用例：`TestWorkerCancelsHandlerWhenLeaseIsLost`（Handler 看到的原因包着 `ErrLeaseLost`，且 succeeded/retried/dead **零写回**）、`TestWorkerKeepsRunningWhenRenewFailsWithInfrastructureError`（连续两次驱动错误后 Handler 仍正常跑完并被成功确认）、`TestWorkerDoesNotReportRenewalsCutShortByShutdown`（停机打断的续租既不算失租也不上报成续租失败）。既有停机用例补上原因断言：`context.Cause` 是 `context.Canceled` 且**不是** `ErrLeaseLost` |
-| [ ] | 过期租约回收 | 未耗尽次数回 pending；耗尽次数进入 dead | 待实现（§4 下一项） |
+| [x] | 过期租约回收 | 未耗尽次数回 pending；耗尽次数进入 dead | 2026-10-15 提交 `75c2e04`：**形态**——能力挂在既有 `WorkerStore` 接口上（`ReapExpiredLeases(ctx, limit)`），不另起可选接口；`Config` 只加 `ReapInterval`（默认 `DefaultReapInterval = 30s`，**负值关闭回收器**，0 由 `WithDefaults` 填成默认值、`Validate` 拒绝），批大小是内部常量 `reapBatchSize = 100` 不进配置（它调的是"回收事务有多长"，属实现细节）。**根包**：`Run` 里与执行循环并列跑一个 ticker 驱动的回收循环，驱动错误只上报、下个周期重试——回收能力要是能被一次数据库抖动关掉，崩溃遗留的任务就会一直没人管；`ctx` 取消即退出，且停机造成的失败不上报。停机等待同时观察执行侧与回收侧，超时消息能区分是哪一侧没停。**store**：一个短事务完成"选出 → 分流 → 写回 → 提交"——`attempt >= max_attempts` 写 `dead`（`last_error='lease expired at final attempt'`、`finished_at`），否则回 `pending`（`run_at = UTC_TIMESTAMP(6)`、清空租约、`last_error='lease expired'`）。写回守卫是**读到的 `lease_until` 原值** + `status='running'`，而不是 owner/epoch：回收器不是租约持有者，没有凭据可比；影响 0 行只跳过该行，**刻意不返回 `ErrLeaseLost`**（那是持有者的语义，借用它会让"集群里有别的回收器在干活"看起来像故障）。`attempt` 与 `lease_epoch` 都不动——这次领取已经用掉一次机会，`epoch` 属于"领取"这个动作。**顺手抓到并修掉一个真 bug**：这条加锁读要连带取 `attempt` / `max_attempts`，两列不在 `ix_gotask_lease` 里，所以它不是覆盖索引；实测优化器改选 `type=ALL, key=NULL, Using filesort`（全表扫描 + 排序），`FOR UPDATE` 在扫描过程中把**整个积压**锁住——`LIMIT` 不再限制加锁范围、`SKIP LOCKED` 失效，12 条过期任务 4 个回收器并发只有一个能推进、合计只回收 3 条（`data_locks` 13 条 vs 修复后 7 条）。已改成 `FORCE INDEX (ix_gotask_lease)`。对照：领取的加锁读只取 `id`，对 `ix_gotask_claim` 天然覆盖故无需提示（`EXPLAIN` 复核实测 `key=ix_gotask_claim, Using index`）。**测试**：根包 6 个用例（按间隔回收、基础设施错误后继续、负值可关闭、停机超时能归因到回收器/两侧、停机造成的回收失败不上报）；真库 9 个用例（回 pending / 耗尽进 dead / 未过期的租约不动 / 非 running 不动 / 迟到租约值被守卫拒绝 / `limit` 生效 / **并发回收安全** / **加锁读的计划与锁范围** / **端到端**见 §6）。其中 `TestReapLockingReadStaysOnLeaseIndex` 抽出来单独钉住"加锁读必须停在 lease 索引上"：计划层断言 `EXPLAIN` 的 `key`，行为层断言一个事务持锁时另一个仍取到不相交的 `limit` 行——用两个手写事务而非两个 Worker，图的是**确定性**（不把成败压在 goroutine 调度上）。**证伪检查**：去掉 `FORCE INDEX` 后该用例（`key=""`、并发读返回 0 行）与并发回收用例（合计只回收 3 条）都立刻失败，还原后与备份逐字节一致 |
 | [x] | fencing 状态写回 | 旧 epoch 无法续租、成功确认或失败确认 | 本行拆成两半，两侧均有真库证据。**成功/失败确认**在 §3 已完成：`succeedTaskSQL`/`retryTaskSQL`/`markDeadTaskSQL` 共用 `(id, status='running', owner, epoch, lease_until 未过期)` 四重条件，§3 已有正常路径与拒绝路径的真库用例。**续租一侧**由 2026-10-15 提交 `7d09e27` 补齐：`TestRenewLeaseRejectsStaleCredentialsAndExpiredLease` 五个子用例覆盖旧 owner、旧 epoch、已过期租约、已是终态（不能被续租复活）、任务不存在，全部返回 `ErrLeaseLost` 且**库里零痕迹**（`lease_until` 未被改动）。另有 `TestRenewLeaseRejectsInvalidInput` 覆盖入参校验（零 ID、空 owner、零/负租约时长） |
 | [ ] | 重试退避与永久错误 | full-jitter 指数退避、上限、永久错误及次数耗尽状态正确 | 待实现 |
 | [ ] | panic 处理 | 单任务 panic 转失败；Worker 不因可恢复 panic 崩溃 | 待实现 |
@@ -101,7 +101,7 @@
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
 | [ ] | 独立示例服务 | 示例业务行与任务行同事务创建；worker 可执行 handler | 待实现 |
-| [ ] | 故障演示 | 文档化停止 Worker、等待租约回收、重启后任务完成 | 待实现 |
+| [ ] | 故障演示 | 文档化停止 Worker、等待租约回收、重启后任务完成 | 待实现——**机制侧已可运行**：`TestWorkerReapsTaskAbandonedByShutdown` 已把"停机遗留 running → 租约自然过期 → 被回收 → 跑完"整条链路跑通，缺的只是把它写成可照着复现的文档/示例（依赖示例服务与可独立运行的入口）。 |
 | [ ] | 官方 GORM adapter | 通过调用方 GORM 事务执行任务 INSERT；核心模块无 GORM 依赖 | 待实现 |
 | [ ] | 结构化日志 | 有 task id/type/queue/attempt/epoch/worker，不泄漏 payload | 待实现 |
 | [ ] | Metrics 接口 | 任务计数、延迟、处理时间、租约失效等指标，无高基数标签 | 待实现 |
@@ -110,19 +110,21 @@
 
 | 状态 | 工作项 | 完成标准 | 证据/备注 |
 |---|---|---|---|
-| [x] | MySQL 集成测试 | 事务、锁、租约和索引语义用真实 MySQL 验证 | 四类语义都已在 MySQL 8.0.46 上验证过（细节见 §2/§3/§4 各行证据）：**事务**——`EnqueueTx` 的提交可见/回滚无痕；**锁**——`FOR UPDATE SKIP LOCKED` 跨会话跳过被锁行（`TestClaimSkipsRowsLockedByAnotherSession`，另会话持有行锁时 Claim 不阻塞且跳过它）；**租约**——claim 置租约与 epoch、续租按数据库时钟延长、失租/过期/易主一律 `ErrLeaseLost`、停机保持 running；**索引**——claim 走 `ix_gotask_claim` 且 `Using index`（`EXPLAIN` 断言）。集成测试**不以 mock 替代**：内存假 store 只用于根包的分支覆盖。 |
+| [x] | MySQL 集成测试 | 事务、锁、租约和索引语义用真实 MySQL 验证 | 四类语义都已在 MySQL 8.0.46 上验证过（细节见 §2/§3/§4 各行证据）：**事务**——`EnqueueTx` 的提交可见/回滚无痕；**锁**——`FOR UPDATE SKIP LOCKED` 跨会话跳过被锁行（`TestClaimSkipsRowsLockedByAnotherSession`，另会话持有行锁时 Claim 不阻塞且跳过它），且加锁范围**受 `LIMIT` 约束**（`TestReapLockingReadStaysOnLeaseIndex`）；**租约**——claim 置租约与 epoch、续租按数据库时钟延长、失租/过期/易主一律 `ErrLeaseLost`、停机保持 running、过期后由回收器接手；**索引**——两条加锁读走哪条索引都用 `EXPLAIN` 钉住：claim 走 `ix_gotask_claim` 且 `Using index`（覆盖），回收的加锁读走 `ix_gotask_lease`（该读非要取 `attempt`/`max_attempts`，"覆盖索引"这条办法不成立，只能显式 `FORCE INDEX`）。集成测试**不以 mock 替代**：内存假 store 只用于根包的分支覆盖。 |
 | [x] | 并发正确性测试 | N 个 worker 并发处理 M 个任务，同租约期每项至多一位有效持有者 | §3「多 Worker 并发领取」三件套已覆盖（提交 `454ccac`）：8 领取者同一栅栏后抢 40 条（两层断言：进程侧 id 不重不漏 + **库侧 `lease_epoch`/`attempt` 全为 1** 的独立复核）、跨会话 `SKIP LOCKED` 跳过被锁行、4 Worker（各 2 并发）跑 24 条且每条 Handler **恰好执行 1 次**。真库上还顺带排除"租约过期被重领"这一混淆因素（领取用 `LeaseDuration = time.Minute`）。 |
-| [ ] | 故障注入：claim 后退出 | 租约过期后任务能重新执行并最终完成 | 待实现——**卡在回收器上**：停机用例已断言"任务留在 running 且租约仍在"（`ShutdownLeavesCancelledTaskRunningForTheReaper`），但没有组件会去捡它，因此"最终完成"这半句现在无法验证。§4「过期租约回收」落地后可补。 |
+| [x] | 故障注入：claim 后退出 | 租约过期后任务能重新执行并最终完成 | 2026-10-15 提交 `75c2e04`：`TestWorkerReapsTaskAbandonedByShutdown` 端到端覆盖——Worker A 的 Handler **无视 ctx**，停机只能超时放弃（`Run` 返回 `ErrShutdownTimeout`），任务留在 `running`；A 的续租看护随停机一起停掉，租约按配置的 `LeaseDuration` **自然过期**（不手工改库）；另一个 Worker 的回收器把它捡回 `pending`，随后被领出来跑完。整个链路只走产品路径，且不依赖任何手工构造的过期租约。**这条用例的写法有个坑值得记下**：必须等 Handler **真的进去了**（用例里用 channel 由 Handler 自己发信号）再取消 A——只等库里的 `status` 变成 `running` 是不够的，claim 提交与 Handler 启动之间有个窗口，在那里停机会让 `runOnce` 按设计跳过整批（剩余任务不启动 Handler），于是 `Run` 干净返回 `nil`——那是正确行为，却让用例测不到它想测的东西。 |
 | [ ] | 故障注入：副作用后 ack 前退出 | 允许重复执行，幂等示例最终效果正确 | 待实现（依赖示例服务） |
 | [ ] | 故障注入：旧 worker 复苏 | fencing 拒绝过期 worker 写回 | 待实现——机制侧已有等价证据：§3 三条写回与 2026-10-15 的续租都用**陈旧 owner/epoch、已过期租约**直接验证了 `ErrLeaseLost` 且库里零痕迹。缺的是"让一个旧 Worker 延迟苏醒再真的尝试写回"的端到端场景，等示例服务再补。 |
-| [x] | Race 检查 | `go test -race` 覆盖 worker 内部并发路径 | 全量 `go test -race -count=1 ./...` 三个包全绿、日志中 **0 处 `DATA RACE`**（2026-10-15 复跑：272 条记录、0 FAIL、0 SKIP）。worker 内部并发路径（并发领取池、每条任务一个租约看护协程、停机与失租同时取消）都在 `-race` 下跑过。 |
+| [x] | Race 检查 | `go test -race` 覆盖 worker 内部并发路径 | 全量 `go test -race -count=1 ./...` 三个包全绿、日志中 **0 处 `DATA RACE`**（2026-10-15 复跑：154 个顶层用例 / 290 条 PASS 记录、0 FAIL、0 SKIP；`store/mysql` 97.9s）。worker 内部并发路径（并发领取池、每条任务一个租约看护协程、**回收循环**、停机与失租同时取消）都在 `-race` 下跑过。根包语句覆盖 100.0%，`store/mysql` 91.4%。 |
 | [ ] | 性能基线 | 记录硬件/DB/配置、吞吐、排队延迟、API/DB成本 | 待实现 |
 | [ ] | README 与语义说明 | 安装、使用、事务入队、至少一次、幂等、恢复和限制齐全 | 进行中——**语义部分已齐**（项目定位、执行语义与边界、至少一次与幂等、fencing 保护范围、本地环境、文档索引，2026-10-15 已把自相矛盾的状态段改成分「已可用/尚未实现」）；**缺**安装与使用示例、`go get` 与最小可运行代码、故障恢复演示（这两项依赖示例服务）。 |
 | [ ] | STAR 指标回填 | 只写实测数值，并保留命令、环境和原始结果 | 待实现（依赖性能基线） |
 
 ## 当前可开工项
 
-§0–§3 全部完成，§4 完成 3/7（租约续期、失租取消 context、fencing 状态写回）。**下一项是 §4「过期租约回收」**——它同时是 §3 留下的缺口的闭合点：停机超时、进程崩溃、失租遗留的 `running` 任务目前只能一直等下去，因为还没有任何组件会去捡它们（已在 README 与 §6「故障注入：claim 后退出」处标注）。
+§0–§3 全部完成，§4 完成 4/7（租约续期、失租取消 context、**过期租约回收**、fencing 状态写回）。**下一项是 §4「重试退避与永久错误」**——它把 §3 刻意留的最简失败策略补齐：目前失败还有次数就立即回 `pending`、次数耗尽进 `dead`，没有 full-jitter 退避，也没有"永久失败不打标记"的分类。回收器落地后 §3 的两个缺口（停机超时、进程崩溃遗留的 `running`）已经闭合，§6「故障注入：claim 后退出」也已可验证。
+
+回收器的现实约束：**回收只在 Worker 进程内跑**，所以"集群里至少有一个 Worker 在运行"是任务终能恢复的前提；Worker 全部下线期间（含用 `ReapInterval` 负值关闭回收器的部署）遗留的 `running` 只剩租约过期、无人接手。这是当前形态的已知边界，写进 README 的语义部分。
 
 已确认的工程约定：module path `github.com/Tidehyc/gorangetask`（gh 账号 `Tidehyc`）、最低 Go 1.24、许可证 MIT、提交以需求为粒度、每次开工前先确认范围。
 

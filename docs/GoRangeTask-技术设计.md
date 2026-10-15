@@ -224,6 +224,12 @@ Reaper 按小批次处理 `running AND lease_until <= UTC_TIMESTAMP(6)`：事务
 
 更新 WHERE 条件同时带上 `status='running'` 和被选中的 `lease_until` 值，且检查 RowsAffected。reaper 只在短事务中更新行；它不执行 Handler。若另一 Worker 已锁定行，`SKIP LOCKED` 使本批次跳过，后续轮次再处理。
 
+实现注记（2026-10-15）：
+
+- **加锁读必须显式指定索引**。回收要连带取 `attempt` / `max_attempts`，这两列不在 `ix_gotask_lease` 里，因此它不是覆盖索引；实测优化器会改选全表扫描 + filesort，而 `FOR UPDATE` 在扫描过程中就把**整个积压**锁住——`LIMIT` 不再限制加锁范围，`SKIP LOCKED` 也失去意义（12 条过期任务、4 个回收器并发，只有 1 个能推进，合计只回收 3 条）。所以这条读写成 `FORCE INDEX (ix_gotask_lease)`。对照：领取的加锁读只取 `id`，对 `ix_gotask_claim` 天然覆盖，无需提示。回归用例 `TestReapLockingReadStaysOnLeaseIndex` 同时钉住计划（`EXPLAIN` 的 `key`）与行为（一个事务持锁时另一个仍取到不相交的 `limit` 行）。
+- **不动 `attempt` / `lease_epoch`**：这次领取已经用掉一次机会，回收只是给下一次让路；`epoch` 属于“领取”这个动作。
+- **守卫用读到的 `lease_until` 原值，而不是 owner/epoch**：回收器不是租约持有者，没有凭据可比。守卫不成立（影响 0 行）只跳过该行，**不返回 `ErrLeaseLost`**——那是持有者的语义，借用它会让“集群里有别的回收器在干活”看起来像故障。`lease_until` 用 `DATE_FORMAT(..., '%Y-%m-%d %H:%i:%s.%f')` 取成字符串原样带回去，避开驱动按 DSN 的 `loc` 重新格式化时间。
+
 ### 5.7 清理终态任务
 
 Cleanup 以小批次选取 `succeeded` 且 `finished_at < UTC_TIMESTAMP(6) - 7 DAY`，以及 `dead` 且超过 30 天的行；按主键删除，避免长事务。保留期可配置。`canceled` 默认按成功任务保留期处理。任务被删除后，其幂等键不再占用唯一键。
