@@ -30,8 +30,8 @@
   导入该包会顺带注册 go-sql-driver，调用方无需再 import 驱动。
   **已完整实现根包 `Client` 接口**（Enqueue / EnqueueTx / Get / Cancel），
   并有编译期断言 `var _ gorangetask.Client = (*Client)(nil)`。
-  **同时实现根包 `WorkerStore`**（Claim / Succeed / Retry / MarkDead，
-  `store/mysql/worker.go`，有第二个编译期断言）。租约续期、回收器、清理还没做。
+  **同时实现根包 `WorkerStore`**（Claim / Succeed / Retry / MarkDead / RenewLease /
+  ReapExpiredLeases，`store/mysql/worker.go`，有第二个编译期断言）。终态清理还没做。
 - `migrations/mysql`（package `mysqlmigrations`）：**独立包，不并入 store**。
   理由：`//go:embed` 不能跨目录向上取文件；迁移是「建表」的完整闭环且已有独立测试。
   调用顺序是「先 `mysqlmigrations.Migrate`，再 `mysqlstore.New`」。
@@ -152,8 +152,12 @@
     用已取消的 ctx 会让已经干完的活白白重做。
   后续 §4 加续租/回收时**不要**改成"停机时写回 pending"。
 - 批内停机：`runOnce` 在启动每条 Handler 前检查 `ctx.Err()`，已取消就整批剩余都不启动。
-- ⚠️ 直接后果：停机遗留的 `running` 任务**只能靠回收器回收**，而 reaper 属 §4、
-  目前不存在 ⇒ 这类任务现在会一直挂着。§4 必须补上。
+- ⚠️ 直接后果（§3 时的缺口，**2026-10-15 已被回收器闭合**）：停机遗留的 `running`
+  任务只能靠回收器回收。当时 reaper 不存在 ⇒ 这类任务会一直挂着；现在回收器落地，
+  但它**跑在 Worker 进程里**，所以"集群里至少有一个 Worker 在运行"仍是恢复的前提。
+  另外：想给这条用例造"停机后任务留在 running"的前提时，**必须等 Handler 真的进去**
+  （用例里让 Handler 自己发信号），只等库里 status 变 running 会撞上 claim 提交与
+  Handler 启动之间的窗口，`runOnce` 按设计跳过整批、`Run` 干净返回 nil（2026-10-15 踩过）。
 
 ## 迁移与列约定（2026-10-13 补，§3 第 5 项）
 
@@ -189,7 +193,36 @@
   first-cancel-wins 保证 `defer cancel()` 不会覆盖它。
 - **顺序：先停租约看护、等它退出，再写回状态**。反过来续租会落在任务写成终态之后，
   因 status 不再是 running 返回 `ErrLeaseLost`，把正常结束的任务报成失租。
-- 停机时**停止续租但不释放租约**；租约自然过期后交给回收器（§4 未完成，仍是缺口）。
+- 停机时**停止续租但不释放租约**；租约自然过期后交给回收器（已实现，见下一节）。
+
+## 过期租约回收约定（2026-10-15 定，§4 第 3 项）
+
+- **形态**：能力挂在既有 `WorkerStore` 接口上（`ReapExpiredLeases(ctx, limit)`），
+  不另起可选接口；`Config` 只加 `ReapInterval`（默认 `DefaultReapInterval = 30s`，
+  **负值关闭回收器**，0 由 `WithDefaults` 填默认、`Validate` 拒绝）；批大小是内部
+  常量 `reapBatchSize = 100`（它调的是"回收事务有多长"，属实现细节，不进配置）。
+- **守卫用读到的 `lease_until` 原值，不用 owner/epoch**：回收器不是租约持有者，
+  没有凭据可比。影响 0 行 ⇒ 只跳过该行，**不返回 `ErrLeaseLost`** —— 那是持有者的
+  语义，借用它会让"集群里有别的回收器在干活"看起来像故障。
+- **不动 `attempt` 与 `lease_epoch`**：一次尝试从成功领取开始，这条任务已经用掉了
+  那次机会，回收只是给下一次让路；`epoch` 属于"领取"这个动作。
+- **⚠️ 加锁读必须显式停在 `ix_gotask_lease` 上（`FORCE INDEX`）**。这条读要连带取
+  `attempt` / `max_attempts`，两列不在索引里 ⇒ 不是覆盖索引 ⇒ 优化器改选
+  `type=ALL, key=NULL, Using filesort`（全表扫描 + 排序）。`FOR UPDATE` 在扫描过程中
+  把**整个积压**锁住：`LIMIT` 不再限制加锁范围、`SKIP LOCKED` 失效。实测 12 条过期任务
+  + 4 个回收器并发 ⇒ 只有一个能推进、合计只回收 3 条；`data_locks` 13 条 vs 修复后 7 条。
+  对照：claim 的加锁读**只取 `id`**，对 `ix_gotask_claim` 天然覆盖（实测
+  `key=ix_gotask_claim, Using index`），所以不需要提示。结论有普适性：**加锁读一旦
+  因为要取别的列而离开覆盖索引，就要用 `FORCE INDEX` 把计划钉死**，别交给优化器。
+- **回归用例要钉两层**（`TestReapLockingReadStaysOnLeaseIndex`）：计划层断言
+  `EXPLAIN` 的 `key`；行为层让一个事务持锁、另一个执行同一条读，断言它仍取到
+  **不相交的 `limit` 行**。用两个手写事务而不是两个 Worker —— 要确定性，不依赖调度。
+  同理 `TestReapIsSafeWithConcurrentReapers`（4 个回收器各 3 条、合计 12）也已是确定性的：
+  任一时刻最多 9 行被锁，第 4 个回收器总能拿到 3 行，所以"合计恰好 12"不是靠运气。
+- 根包 `Run` 的停机等待**同时观察执行侧与回收侧的 done 信号**，超时消息要能区分
+  "handlers still running" / "the reaper not stopped" / 两者都没停。回收循环的
+  驱动错误只上报、下个周期重试（回收能力不能被一次数据库抖动关掉）；`ctx` 取消
+  导致的失败是停机附带结果，**不上报**。
 
 ## 测试写法补充（2026-10-15）
 

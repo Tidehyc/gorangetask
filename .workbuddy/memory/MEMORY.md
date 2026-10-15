@@ -49,6 +49,12 @@
 - 别用 `time.Sleep` 卡超时用例（用 `select` + `ctx.Done()`）；要断言顺序性质就用**门闸**
   把竞争窗口撑成确定的。
 - 并发用例除进程侧记录外，还要用一个**库侧单调量**独立复核（如 `lease_epoch` 全为 1）。
-- 仓库内不建临时目录（沙箱 `rm` 是 safe-delete 垫片，会污染 git status）；用 `/bin/rm`，
+- **加锁读必须停在预期二级索引上**，否则 `LIMIT` 不再限制加锁范围、`SKIP LOCKED` 失效。
+  办法：只取索引内列（覆盖索引，如 claim 只取 `id`）；若业务上必须多取几列，就显式
+  `FORCE INDEX`（回收器取 `attempt`/`max_attempts` 即此类）。**用 `EXPLAIN` 的 `key`
+  ＋一次并发加锁读钉成回归用例**，别指望优化器——实测它会改选全表扫描 + filesort，
+  把整个积压锁住（12 条任务 4 个回收器只回收 3 条）。
+- 仓库内不建临时目录（沙箱 `rm` 是 safe-delete 垫片，会污染 git status）。⚠️ 沙箱里
+  `rm`/`unlink`（**含 `/bin/rm`**）都可能直接失败（EBUSY），删文件改用 Python `os.remove`；
   或把实验放到 `/home/tide/.cache/`。
 - 沙箱会把脚本里的变量名 `sc`/`reg` 当成系统命令拦截（误报），写脚本时避开。
