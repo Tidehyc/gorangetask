@@ -23,6 +23,7 @@ type fakeStore struct {
 	succeeded []TaskID
 	retried   []retryCall
 	dead      []deadCall
+	renewals  []ClaimedTask
 
 	succeedErr error
 	retryErr   error
@@ -30,6 +31,17 @@ type fakeStore struct {
 
 	// onSucceed 在成功确认后被调用（用于测试里等待异步处理完成）。
 	onSucceed func(TaskID)
+
+	// renewFn 决定第 call 次（从 1 开始）续租的返回；为 nil 时一律成功。
+	// 用例用它来制造失租、数据库错误，或把"已经续够了"当作同步点。它拿到的是
+	// 这次续租自己的 ctx，因此也能模拟"语句执行到一半被取消"的真驱动行为。
+	renewFn func(ctx context.Context, call int, task ClaimedTask) error
+
+	// renewsInFlight 是当前正在进行的续租数，writeBackWhileRenewing 记录
+	// "写回时仍有续租在途"这一越界行为。process 必须先停止看护再写回，
+	// 否则续租会在任务写成终态之后到达并凭空报出 ErrLeaseLost。
+	renewsInFlight         int
+	writeBackWhileRenewing bool
 
 	// honourCtx 为 true 时，写回方法像真实驱动那样在 ctx 已取消时直接失败。
 	// 用于证明"停机期间的成功确认确实换用了脱离取消的 context"——否则这个
@@ -65,6 +77,7 @@ func (f *fakeStore) Claim(_ context.Context, spec ClaimSpec) ([]ClaimedTask, err
 }
 
 func (f *fakeStore) Succeed(ctx context.Context, task ClaimedTask) error {
+	f.noteWriteBack()
 	if err := f.ctxErr(ctx); err != nil {
 		return err
 	}
@@ -81,6 +94,7 @@ func (f *fakeStore) Succeed(ctx context.Context, task ClaimedTask) error {
 }
 
 func (f *fakeStore) Retry(ctx context.Context, task ClaimedTask, delay time.Duration, lastError string) error {
+	f.noteWriteBack()
 	if err := f.ctxErr(ctx); err != nil {
 		return err
 	}
@@ -93,6 +107,7 @@ func (f *fakeStore) Retry(ctx context.Context, task ClaimedTask, delay time.Dura
 }
 
 func (f *fakeStore) MarkDead(ctx context.Context, task ClaimedTask, lastError string) error {
+	f.noteWriteBack()
 	if err := f.ctxErr(ctx); err != nil {
 		return err
 	}
@@ -102,6 +117,40 @@ func (f *fakeStore) MarkDead(ctx context.Context, task ClaimedTask, lastError st
 
 	f.dead = append(f.dead, deadCall{task: task, lastError: lastError})
 	return f.deadErr
+}
+
+// RenewLease 记录一次续租，并调用 renewFn 决定结果。
+func (f *fakeStore) RenewLease(ctx context.Context, task ClaimedTask, _ time.Duration) error {
+	if err := f.ctxErr(ctx); err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	f.renewals = append(f.renewals, task)
+	call := len(f.renewals)
+	f.renewsInFlight++
+	fn := f.renewFn
+	f.mu.Unlock()
+
+	var err error
+	if fn != nil {
+		err = fn(ctx, call, task)
+	}
+
+	f.mu.Lock()
+	f.renewsInFlight--
+	f.mu.Unlock()
+	return err
+}
+
+// noteWriteBack 记录一次状态写回，并检查它是否与续租重叠：
+// process 必须"先停看护、再写回"，重叠就说明这个顺序被破坏了。
+func (f *fakeStore) noteWriteBack() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.renewsInFlight > 0 {
+		f.writeBackWhileRenewing = true
+	}
 }
 
 // ctxErr 在开了 honourCtx 时把 ctx 的取消状态当作驱动错误返回。
@@ -136,6 +185,18 @@ func (f *fakeStore) deadCalls() []deadCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]deadCall(nil), f.dead...)
+}
+
+func (f *fakeStore) renewCalls() []ClaimedTask {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ClaimedTask(nil), f.renewals...)
+}
+
+func (f *fakeStore) wroteBackWhileRenewing() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writeBackWhileRenewing
 }
 
 // claimedTask 造一条领取结果。
@@ -792,11 +853,13 @@ func TestWorkerShutdownCancelsInFlightHandlerAndDoesNotWriteBack(t *testing.T) {
 
 	started := make(chan struct{})
 	sawCancel := make(chan error, 1)
+	sawCause := make(chan error, 1)
 	reg := NewRegistry()
 	if err := reg.Register("t", func(ctx context.Context, _ json.RawMessage) error {
 		close(started)
 		<-ctx.Done() // 只观察取消，不做业务
 		sawCancel <- ctx.Err()
+		sawCause <- context.Cause(ctx)
 		return ctx.Err()
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -827,6 +890,17 @@ func TestWorkerShutdownCancelsInFlightHandlerAndDoesNotWriteBack(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("handler was never cancelled by shutdown")
+	}
+
+	// 停机的取消原因必须与"失去租约"区分开：失租会让 Worker 连成功都不写回，
+	// 而停机允许把已经成功的结果确认掉。把两者混成一个原因就会改错行为。
+	select {
+	case cause := <-sawCause:
+		if !errors.Is(cause, context.Canceled) || errors.Is(cause, ErrLeaseLost) {
+			t.Errorf("context.Cause = %v, want context.Canceled (not a lease loss)", cause)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never reported the cancellation cause")
 	}
 
 	select {
@@ -1060,6 +1134,7 @@ func TestWorkerUsesPerTaskTimeout(t *testing.T) {
 
 			type observation struct {
 				err     error
+				cause   error
 				elapsed time.Duration
 			}
 			seen := make(chan observation, 1)
@@ -1072,7 +1147,7 @@ func TestWorkerUsesPerTaskTimeout(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					// 超时没生效；不阻塞用例，交给断言报错。
 				}
-				seen <- observation{err: hctx.Err(), elapsed: time.Since(start)}
+				seen <- observation{err: hctx.Err(), cause: context.Cause(hctx), elapsed: time.Since(start)}
 				return hctx.Err()
 			}); err != nil {
 				t.Fatalf("Register: %v", err)
@@ -1093,6 +1168,10 @@ func TestWorkerUsesPerTaskTimeout(t *testing.T) {
 			if !errors.Is(got.err, context.DeadlineExceeded) {
 				t.Fatalf("handler context error = %v, want context.DeadlineExceeded", got.err)
 			}
+			// 取消原因必须能被分辨出来：超时就是超时，不能与停机、失租混为一谈。
+			if !errors.Is(got.cause, context.DeadlineExceeded) {
+				t.Errorf("context.Cause = %v, want context.DeadlineExceeded", got.cause)
+			}
 			// 截断只能来自 deadline，不能来自别处：太短说明用错了更小的值，
 			// 接近 5s 说明超时根本没生效（安全定时器兜的底）。
 			if got.elapsed < cutoff/2 || got.elapsed > 2*time.Second {
@@ -1103,5 +1182,360 @@ func TestWorkerUsesPerTaskTimeout(t *testing.T) {
 				t.Errorf("retry called %d time(s), want 1: a handler timeout is a normal task failure", len(retries))
 			}
 		})
+	}
+}
+
+// --- 租约续期与失租 ---------------------------------------------------------
+//
+// 这几条用例都直接调 runOnce 而不是 Run：心跳看护是在 process 里起的，
+// 与 Run 的领取循环无关，单独跑一轮更确定。
+
+// TestWorkerRenewsLeaseWhileHandlerRuns 固定"在途任务会被持续续租"，并顺带固定
+// 续租用的是**本次领取**的 owner/epoch——续租与三条写回一样是"凭租约说话"的操作，
+// 用错凭据续租等于给别人的任务续命。
+func TestWorkerRenewsLeaseWhileHandlerRuns(t *testing.T) {
+	const renewals = 3
+
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(7, "t", 1, 3)}}}
+	enough := make(chan struct{})
+	var once sync.Once
+	store.renewFn = func(_ context.Context, call int, _ ClaimedTask) error {
+		if call >= renewals {
+			once.Do(func() { close(enough) })
+		}
+		return nil
+	}
+
+	reg := NewRegistry()
+	// Handler 一直跑到"续租确实发生过 N 次"为止：等一个可观测的事实，
+	// 而不是睡固定时长——宿主负载高时它只会变慢，不会误报。
+	if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+		select {
+		case <-enough:
+			return nil
+		case <-hctx.Done():
+			return context.Cause(hctx)
+		case <-time.After(10 * time.Second):
+			return errors.New("handler waited too long for lease renewals")
+		}
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.LeaseDuration = time.Hour // 租约远长于用例时长，续租只可能来自看护
+	cfg.HeartbeatInterval = time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	renews := store.renewCalls()
+	if len(renews) < renewals {
+		t.Fatalf("renewed the lease %d time(s), want at least %d", len(renews), renewals)
+	}
+	want := claimedTask(7, "t", 1, 3)
+	for i, got := range renews {
+		if got.ID != want.ID || got.Owner != want.Owner || got.Epoch != want.Epoch {
+			t.Errorf("renewal %d used id=%d owner=%q epoch=%d, want id=%d owner=%q epoch=%d",
+				i+1, got.ID, got.Owner, got.Epoch, want.ID, want.Owner, want.Epoch)
+		}
+	}
+	// 续租只是延长租约，不能改变任务的结果。
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 7 {
+		t.Errorf("succeeded = %v, want [7]", got)
+	}
+	if n := len(store.retryCalls()); n != 0 {
+		t.Errorf("retried %d time(s), want 0", n)
+	}
+	if n := len(store.deadCalls()); n != 0 {
+		t.Errorf("marked %d dead, want 0", n)
+	}
+}
+
+// TestWorkerCancelsHandlerWhenLeaseIsLost 固定失租后的完整反应（需求文档 §4.4）：
+// 续租被拒 ⇒ 取消 Handler 的 context，且 Handler 能看到原因是 ErrLeaseLost；
+// 本次执行的任何结果都**不写回**——任务已经归新的持有者，写也只会被 fencing 拒绝。
+func TestWorkerCancelsHandlerWhenLeaseIsLost(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(21, "t", 1, 3)}}}
+	store.renewFn = func(context.Context, int, ClaimedTask) error {
+		return fmt.Errorf("%w: task 21 is held by another worker now", ErrLeaseLost)
+	}
+
+	// Handler 与 process 跑在同一个 goroutine 上，因此这里用普通变量回传即可。
+	var handlerCause error
+	reg := NewRegistry()
+	if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+		select {
+		case <-hctx.Done():
+			handlerCause = context.Cause(hctx)
+		case <-time.After(5 * time.Second):
+			handlerCause = errors.New("handler was never cancelled after losing the lease")
+		}
+		return hctx.Err()
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.LeaseDuration = time.Hour
+	cfg.HeartbeatInterval = time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var reported []error
+	w.onError = func(err error) { reported = append(reported, err) }
+
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	if !errors.Is(handlerCause, ErrLeaseLost) {
+		t.Errorf("context.Cause seen by the handler = %v, want it to wrap ErrLeaseLost", handlerCause)
+	}
+	if n := len(store.succeededIDs()); n != 0 {
+		t.Errorf("succeeded %d, want 0: a lease-holding worker cannot write results any more", n)
+	}
+	if n := len(store.retryCalls()); n != 0 {
+		t.Errorf("retried %d time(s), want 0: 失租不是任务失败，任务已归别人", n)
+	}
+	if n := len(store.deadCalls()); n != 0 {
+		t.Errorf("marked %d dead, want 0", n)
+	}
+	if len(reported) == 0 {
+		t.Error("losing the lease must be reported; it is invisible otherwise")
+	}
+}
+
+// TestWorkerKeepsRunningWhenRenewFailsWithInfrastructureError 固化"续租失败 ≠ 失租"
+// （需求文档 §9）：连接抖动只说明这次没问成，租约可能仍然有效，绝不能据此取消
+// Handler。若把驱动错误误判成失租，一次数据库抖动就会把所有在途任务半路掐掉。
+func TestWorkerKeepsRunningWhenRenewFailsWithInfrastructureError(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(31, "t", 1, 3)}}}
+
+	const transientFailures = 2
+	recovered := make(chan struct{})
+	var once sync.Once
+	store.renewFn = func(_ context.Context, call int, _ ClaimedTask) error {
+		if call > transientFailures {
+			once.Do(func() { close(recovered) })
+			return nil
+		}
+		return errors.New("driver: connection reset by peer")
+	}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+		select {
+		case <-recovered:
+			return nil
+		case <-hctx.Done():
+			// 被取消就意味着有人把基础设施错误当成了失租。
+			return fmt.Errorf("handler was cancelled even though the lease was never lost: %w", context.Cause(hctx))
+		case <-time.After(10 * time.Second):
+			return errors.New("lease renewals never recovered")
+		}
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.LeaseDuration = time.Hour
+	cfg.HeartbeatInterval = time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var reported []error
+	w.onError = func(err error) { reported = append(reported, err) }
+
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	// 被取消的 Handler 会返回错误并走重试路径，因此"任务成功"本身就证明它没被取消。
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 31 {
+		t.Errorf("succeeded = %v, want [31]: 续租的基础设施错误不该打断执行", got)
+	}
+	if n := len(store.retryCalls()); n != 0 {
+		t.Errorf("retried %d time(s), want 0", n)
+	}
+	if len(store.renewCalls()) <= transientFailures {
+		t.Errorf("renewed %d time(s), want more than %d: 失败之后必须继续重试",
+			len(store.renewCalls()), transientFailures)
+	}
+	if len(reported) < transientFailures {
+		t.Errorf("reported %d renew error(s), want at least %d: 续租失败必须被上报",
+			len(reported), transientFailures)
+	}
+}
+
+// TestWorkerStopsLeaseWatchBeforeWritingBack 固定 process 里的顺序：**先停看护、
+// 等它退出，再写回**。
+//
+// 顺序反过来的后果不是"少一次续租"，而是凭空多出一类错误：任务写成终态之后到达的
+// 续租会因为 status 不再是 running 而返回 ErrLeaseLost，把一个已经正常结束的任务
+// 报成"失租"。这条用例把第一次续租挂在半途，制造出一个确定的"续租在途"窗口——
+// 只要写回发生在窗口内，store 就会记下越界。
+func TestWorkerStopsLeaseWatchBeforeWritingBack(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(51, "t", 1, 3)}}}
+
+	renewStarted := make(chan struct{})
+	releaseRenew := make(chan struct{})
+	var once sync.Once
+	store.renewFn = func(context.Context, int, ClaimedTask) error {
+		once.Do(func() { close(renewStarted) })
+		<-releaseRenew // 把这次续租挂在半途
+		return nil
+	}
+
+	handlerReturned := make(chan struct{})
+	reg := NewRegistry()
+	if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+		defer close(handlerReturned)
+		select {
+		case <-renewStarted:
+			return nil
+		case <-time.After(5 * time.Second):
+			return errors.New("the lease watch never renewed")
+		}
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.LeaseDuration = time.Hour
+	cfg.HeartbeatInterval = time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = w.runOnce(context.Background())
+	}()
+
+	// Handler 返回时那次续租必然仍在途（releaseRenew 还没关），因此接下来
+	// 放行它——正确的实现此刻还停在"等看护退出"，错误的实现已经写回完了。
+	select {
+	case <-handlerReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never returned")
+	}
+	close(releaseRenew)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runOnce did not return")
+	}
+
+	if store.wroteBackWhileRenewing() {
+		t.Error("a write-back overlapped an in-flight lease renewal: 写回前必须已经停掉租约看护")
+	}
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 51 {
+		t.Errorf("succeeded = %v, want [51]", got)
+	}
+	if n := len(store.renewCalls()); n < 1 {
+		t.Errorf("renewed %d time(s), want at least 1", n)
+	}
+}
+
+// TestWorkerDoesNotReportRenewalsCutShortByShutdown 固定看护里一个容易搞反的细节：
+// 停机打断的续租**不是失租**，也不该被上报成续租失败。
+//
+// 真驱动的续租语句会因为 ctx 已取消而直接失败，那看上去像一条基础设施错误，
+// 实际只是停机的附带结果。把它当成失租会去取消一个本就在停机中的 Handler；
+// 当成基础设施错误则会为每次停机刷出一条噪音。
+func TestWorkerDoesNotReportRenewalsCutShortByShutdown(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(81, "t", 1, 3)}}}
+
+	renewStarted := make(chan struct{})
+	var once sync.Once
+	store.renewFn = func(rctx context.Context, _ int, _ ClaimedTask) error {
+		once.Do(func() { close(renewStarted) })
+		// 像真驱动一样：语句卡在执行中，ctx 一取消就失败。
+		<-rctx.Done()
+		return rctx.Err()
+	}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(hctx context.Context, _ json.RawMessage) error {
+		<-renewStarted // 先等续租确实卡住，再等停机取消
+		<-hctx.Done()
+		return hctx.Err()
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.LeaseDuration = time.Hour
+	cfg.HeartbeatInterval = time.Millisecond
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = w.runOnce(ctx)
+	}()
+
+	select {
+	case <-renewStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lease watch never renewed")
+	}
+	cancel() // 停机：在途的那次续租会被取消
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runOnce did not return after shutdown")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	shutdownReports := 0
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "renew lease") {
+			t.Errorf("a renewal cut short by shutdown was reported as a renewal failure: %v", err)
+		}
+		if strings.Contains(err.Error(), "shutdown in progress") {
+			shutdownReports++
+		}
+	}
+	// 反向确认这条用例不是空转：停机路径本身仍然必须上报。
+	if shutdownReports == 0 {
+		t.Errorf("expected the shutdown report to still happen, got %v", reported)
+	}
+	if n := len(store.succeededIDs()); n != 0 {
+		t.Errorf("succeeded %d, want 0: 停机取消的任务不能写回", n)
+	}
+	if n := len(store.retryCalls()); n != 0 {
+		t.Errorf("retried %d time(s), want 0", n)
+	}
+	if n := len(store.deadCalls()); n != 0 {
+		t.Errorf("marked %d dead, want 0", n)
 	}
 }

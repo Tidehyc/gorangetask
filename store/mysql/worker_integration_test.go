@@ -1339,6 +1339,275 @@ func TestClaimRestoresPerTaskTimeout(t *testing.T) {
 	}
 }
 
+// --- 租约续期 ---------------------------------------------------------------
+
+// TestRenewLeaseExtendsLeaseUntilFromDatabaseClock 固定续租的两件事：新的到期时间
+// 从**数据库当前时间**起算，且除租约本身之外什么都不动。
+//
+// "从数据库当前时间起算"不是风格问题：若在旧的 lease_until 上累加，租约会随每次
+// 续租越推越远，一次续租失败就能把任务锁住远超预期的时间。两种算法的结果相差整整
+// 一个原始租约长度（30s），所以区间断言能把累加的实现明确排除掉。
+func TestRenewLeaseExtendsLeaseUntilFromDatabaseClock(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue     = "q-renew"
+		extension = 45 * time.Second
+	)
+
+	id, err := c.Enqueue(ctx, gorangetask.Task{Queue: queue, Type: "t", Payload: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	task := claimOnce(t, c, queue, "renew-owner")
+	if task.ID != id {
+		t.Fatalf("claimed task %d, want %d", task.ID, id)
+	}
+
+	before := readTask(t, db, id)
+	renewAt := dbNow(t, db)
+	if err := c.RenewLease(ctx, task, extension); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+	after := readTask(t, db, id)
+
+	if after.status != string(gorangetask.StatusRunning) {
+		t.Errorf("status = %q after renewing, want running", after.status)
+	}
+	if after.leaseEpoch != before.leaseEpoch {
+		t.Errorf("lease_epoch = %d after renewing, want %d unchanged", after.leaseEpoch, before.leaseEpoch)
+	}
+	if after.attempt != before.attempt {
+		t.Errorf("attempt = %d after renewing, want %d unchanged", after.attempt, before.attempt)
+	}
+	if after.leaseOwner.String != before.leaseOwner.String {
+		t.Errorf("lease_owner = %q after renewing, want %q unchanged", after.leaseOwner.String, before.leaseOwner.String)
+	}
+	if !after.leaseUntil.Valid {
+		t.Fatal("lease_until became NULL after renewing")
+	}
+	if !after.leaseUntil.Time.After(before.leaseUntil.Time) {
+		t.Errorf("lease_until = %v after renewing, want later than %v", after.leaseUntil.Time, before.leaseUntil.Time)
+	}
+
+	// 允许取时间与执行 UPDATE 之间有一点推进；累加的实现会落在 renewAt+75s 附近，
+	// 远在这个区间之外。
+	earliest, latest := renewAt.Add(extension-time.Second), renewAt.Add(extension+5*time.Second)
+	if after.leaseUntil.Time.Before(earliest) || after.leaseUntil.Time.After(latest) {
+		t.Errorf("lease_until = %v after renewing, want it within [%v, %v] (数据库当前时间 + %s)",
+			after.leaseUntil.Time, earliest, latest, extension)
+	}
+	if after.updatedAt.Before(before.updatedAt) {
+		t.Errorf("updated_at went backwards: %v -> %v", before.updatedAt, after.updatedAt)
+	}
+}
+
+// TestRenewLeaseRejectsStaleCredentialsAndExpiredLease 把"续租也要过 fencing"钉在
+// 真库上（需求文档 §4.4「过期 Worker 的更新必须影响 0 行」）。旧持有者若还能续租，
+// 就能把自己"续"回有效状态，fencing 也就形同虚设。
+//
+// 每个子用例都用自己的任务：这类断言的失败方式恰恰是"什么都没发生"，
+// 复用同一条任务会让前一个子用例留下的状态混进来。
+func TestRenewLeaseRejectsStaleCredentialsAndExpiredLease(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue = "q-renew-fencing"
+		lease = 30 * time.Second
+	)
+
+	freshTask := func(t *testing.T, owner string) gorangetask.ClaimedTask {
+		t.Helper()
+
+		if _, err := c.Enqueue(ctx, gorangetask.Task{
+			Queue: queue, Type: "t", Payload: json.RawMessage(`{}`),
+		}); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		tasks, err := c.Claim(ctx, gorangetask.ClaimSpec{
+			Queue: queue, Limit: 1, Owner: owner, LeaseDuration: lease,
+		})
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if len(tasks) != 1 {
+			t.Fatalf("Claim returned %d tasks, want 1", len(tasks))
+		}
+		return tasks[0]
+	}
+
+	// assertRefused 断言这次续租被拒，且**没有**在库里留下任何痕迹。
+	assertRefused := func(t *testing.T, stale gorangetask.ClaimedTask) {
+		t.Helper()
+
+		before := readTask(t, db, stale.ID)
+		if err := c.RenewLease(ctx, stale, lease); !errors.Is(err, gorangetask.ErrLeaseLost) {
+			t.Fatalf("RenewLease() error = %v, want ErrLeaseLost", err)
+		}
+		after := readTask(t, db, stale.ID)
+		if !after.leaseUntil.Time.Equal(before.leaseUntil.Time) {
+			t.Errorf("lease_until moved from %v to %v even though the renewal was refused",
+				before.leaseUntil.Time, after.leaseUntil.Time)
+		}
+	}
+
+	t.Run("stale owner", func(t *testing.T) {
+		stale := freshTask(t, "renew-owner-a")
+		stale.Owner = "renew-owner-b"
+		assertRefused(t, stale)
+	})
+
+	t.Run("stale epoch", func(t *testing.T) {
+		stale := freshTask(t, "renew-owner-a")
+		stale.Epoch++
+		assertRefused(t, stale)
+	})
+
+	t.Run("expired lease", func(t *testing.T) {
+		task := freshTask(t, "renew-owner-a")
+		expireLease(t, db, task.ID)
+		assertRefused(t, task)
+	})
+
+	t.Run("task already finished", func(t *testing.T) {
+		task := freshTask(t, "renew-owner-a")
+		if err := c.Succeed(ctx, task); err != nil {
+			t.Fatalf("Succeed: %v", err)
+		}
+		// 终态任务不能被续租"复活"。
+		assertRefused(t, task)
+	})
+
+	t.Run("unknown task", func(t *testing.T) {
+		// 不存在的任务没法用 readTask 比较，单独断言错误分类即可。
+		ghost := freshTask(t, "renew-owner-a")
+		ghost.ID = gorangetask.TaskID(1) << 40
+		if err := c.RenewLease(ctx, ghost, lease); !errors.Is(err, gorangetask.ErrLeaseLost) {
+			t.Fatalf("RenewLease(unknown task) error = %v, want ErrLeaseLost", err)
+		}
+	})
+}
+
+// TestWorkerRenewsLeaseSoHandlerCanOutliveOneLease 是租约续期的端到端证据：
+// Handler 刻意跑得比一次 LeaseDuration 更长，仍然必须成功写回。
+//
+// 它同时证明 §3 留下的缺口已经闭合——没有续租时，租约会在 Handler 中途过期，
+// 最后那次"成功"写回被 fencing 拒掉，任务永远停在 running（回收器属 §4 后续项，
+// 目前没人会去捡它）。
+//
+// 用例不靠"睡够两倍租约"来构造前提，而是让 Handler 轮询数据库直到**亲眼看到**
+// 租约被续到比初始更晚、且数据库时钟已越过初始到期时间，再返回。宿主负载高时
+// 它只会变慢，不会把"续租没发生"误报成通过。
+func TestWorkerRenewsLeaseSoHandlerCanOutliveOneLease(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	const (
+		queue = "q-long-handler"
+		lease = 3 * time.Second
+	)
+
+	id, err := c.Enqueue(ctx, gorangetask.Task{
+		Queue: queue, Type: "long.task", Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Handler 与 test goroutine 不同，这些值在 Run 返回后才读取（有 happens-before）。
+	var (
+		firstUntil  time.Time
+		seenUntil   time.Time
+		seenAt      time.Time
+		handlerTime time.Duration
+	)
+
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "long.task", func(hctx context.Context, _ json.RawMessage) error {
+		start := time.Now()
+		for {
+			var until, now time.Time
+			if err := db.QueryRowContext(hctx,
+				"SELECT lease_until, UTC_TIMESTAMP(6) FROM "+tasksTable+" WHERE id = ?",
+				int64(id)).Scan(&until, &now); err != nil {
+				return fmt.Errorf("read lease while running: %w", err)
+			}
+			until, now = until.UTC(), now.UTC()
+			if firstUntil.IsZero() {
+				firstUntil = until
+			}
+			// 两件事都要满足：租约被延到了比初始更晚的时刻，且数据库时钟已经越过
+			// 初始到期时间——也就是"确实跑得比一次租约更长"。
+			if until.After(firstUntil) && now.After(firstUntil) {
+				seenUntil, seenAt, handlerTime = until, now, time.Since(start)
+				return nil
+			}
+			select {
+			case <-hctx.Done():
+				handlerTime = time.Since(start)
+				return fmt.Errorf("handler was cut short after %s, before the lease could be seen as renewed: %w",
+					handlerTime, context.Cause(hctx))
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	})
+
+	cfg := workerConfig(queue)
+	cfg.LeaseDuration = lease
+	cfg.HeartbeatInterval = 500 * time.Millisecond
+	// 上限放宽到远超租约：这条用例要证明的是"续租让长任务活下来"，
+	// 不该被 Handler 超时提前打断。
+	cfg.HandlerTimeout = 20 * time.Second
+
+	w, err := gorangetask.NewWorker(c, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	// 用例中途失败时也要让 Worker 停下来，避免留下一个还在轮询的 goroutine。
+	t.Cleanup(cancelRun)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(runCtx) }()
+
+	row := waitForStatus(t, db, id, string(gorangetask.StatusSucceeded), 25*time.Second)
+
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1: 续租正常时不该有第二次领取", row.attempt)
+	}
+	if row.leaseEpoch != 1 {
+		t.Errorf("lease_epoch = %d, want 1: 续租不该改变租约代数", row.leaseEpoch)
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease not cleared on success: owner=%v until=%v", row.leaseOwner, row.leaseUntil)
+	}
+	if !row.finishedAt.Valid {
+		t.Error("finished_at is NULL after a successful task")
+	}
+
+	cancelRun()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	if !seenUntil.After(firstUntil) {
+		t.Errorf("observed lease_until %v was never extended beyond the first value %v", seenUntil, firstUntil)
+	}
+	if !seenAt.After(firstUntil) {
+		t.Errorf("handler finished at %v without outliving the first lease (until %v)", seenAt, firstUntil)
+	}
+	t.Logf("handler ran %s; first lease_until=%v, extended lease_until=%v, db now at that point=%v",
+		handlerTime, firstUntil, seenUntil, seenAt)
+}
+
 // --- 优雅停机 ---------------------------------------------------------------
 
 // TestShutdownLeavesCancelledTaskRunningForTheReaper 把"停机不提前释放租约"钉在

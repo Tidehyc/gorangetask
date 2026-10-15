@@ -3,6 +3,7 @@ package gorangetask
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -66,11 +67,22 @@ type ClaimSpec struct {
 //     事务或行锁持有期间运行。
 //   - Claim 应当只领取 status='pending' 且 run_at 已到期的任务，并原子地把它们
 //     置为 running、递增 lease_epoch 与 attempt。
-//   - Succeed / Retry / MarkDead 必须校验 (id, status='running', owner, epoch,
-//     租约未过期) 这组条件；影响 0 行时返回 ErrLeaseLost，不得用无条件更新补救。
+//   - Succeed / Retry / MarkDead / RenewLease 必须校验 (id, status='running',
+//     owner, epoch, 租约未过期) 这组条件；影响 0 行时返回 ErrLeaseLost，
+//     不得用无条件更新补救。
 type WorkerStore interface {
 	// Claim 原子领取一批到期任务。没有可领取的任务时返回空切片且 err 为 nil。
 	Claim(ctx context.Context, spec ClaimSpec) ([]ClaimedTask, error)
+
+	// RenewLease 把任务的租约延长 leaseDuration，从**数据库当前时间**起算。
+	//
+	// 它守卫的是"Handler 跑得比一次租约更长"这件事：只要续租一直成功，长任务
+	// 就不会因为租约过期而被别人重领。因此它的 fencing 条件与写回完全相同。
+	//
+	// 返回 ErrLeaseLost 与返回驱动错误必须被区分：前者表示这次执行已经不再持有
+	// 租约，调用方要立刻停手；后者只表示"这次没问成"，租约可能仍然有效，
+	// 应当原样冒泡、稍后重试，不能被翻译成 ErrLeaseLost。
+	RenewLease(ctx context.Context, task ClaimedTask, leaseDuration time.Duration) error
 
 	// Succeed 把任务写为 succeeded 终态、清空租约并设置 finished_at。
 	Succeed(ctx context.Context, task ClaimedTask) error
@@ -97,12 +109,26 @@ type WorkerStore interface {
 //   - 成功：写回 succeeded 终态。
 //   - 失败：写回 pending 立即重试；若尝试次数已耗尽则写为 dead。
 //   - 优雅停机（§3「Worker graceful shutdown」）：见 Run 的说明。
+//   - 租约续期与失租取消（§4「租约续期」「lease 丢失取消 context」）：见下方
+//     「本次执行的三条取消路径」。
+//
+// # 本次执行的三条取消路径
+//
+// 传给 Handler 的 context 可能因为三种互不相同的原因被取消，Handler 可以用
+// context.Cause 分辨它们：
+//
+//   - **停机**：Run 的 ctx 被取消，原因是 context.Canceled。Worker 会停止领取新任务、
+//     不再为该任务续租，但**不释放租约**；任务保持 running 等租约自然过期。
+//   - **逐任务超时**：原因是 context.DeadlineExceeded（Task.Timeout，未设置则用
+//     Config.HandlerTimeout）。这算一次普通的失败，正常走重试/死信。
+//   - **失去租约**：原因是 ErrLeaseLost。续租被拒说明任务已经归别人，本次执行的
+//     任何结果都不再被接受，Worker 不会写回任何状态。
+//
+// 取消始终是**协作式**的：它不会回滚 Handler 已经造成的业务副作用，只是通知
+// Handler 尽快收手。Handler 必须在长耗时操作中观察 ctx。
 //
 // 尚未实现的语义（后续工作项，文档已排期）：
-//   - **租约续期（§4）**：Handler 必须能在 LeaseDuration 内结束。超时后租约过期，
-//     本次写回会被 fencing 拒绝（ErrLeaseLost），任务要等回收器（§4）才能重领。
-//   - **租约丢失取消 context（§4）**：Handler 不会因失租被提前取消；它只观察停机取消。
-//   - **回收器（§4）**：进程崩溃、停机超时留下的 running 任务暂无人回收，
+//   - **回收器（§4）**：进程崩溃、停机超时、失租留下的 running 任务暂无人回收，
 //     只能等租约过期（目前没有任何组件会去捡它们）。
 //   - **指数退避与永久错误（§4）**：失败一律立即重试，不区分 Permanent，
 //     也不做退避；因此永久失败的任务会尝试到次数耗尽才进入 dead。
@@ -273,7 +299,36 @@ func (w *Worker) runOnce(ctx context.Context) (int, error) {
 // process 执行一条已领取的任务并写回结果。它不返回 error：任务的失败是
 // 预期内的结果，写回存储即可；写回本身失败才通过 report 上报。
 func (w *Worker) process(ctx context.Context, task ClaimedTask) {
-	err := w.execute(ctx, task)
+	// 本次执行有两种彼此独立的提前终止原因：整个 Worker 停机（ctx）与本任务
+	// 失去租约（下面的看护协程取消 taskCtx）。用 CancelCause 把原因分开，
+	// 才能对"要不要写回"作不同判断——停机时不写回失败但成功仍确认，失租时
+	// 什么都不能写。Handler 也能通过 context.Cause 分辨自己是被谁叫停的。
+	taskCtx, cancelTask := context.WithCancelCause(ctx)
+	defer cancelTask(nil)
+
+	stop := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		w.watchLease(taskCtx, stop, task, cancelTask)
+	}()
+
+	err := w.execute(taskCtx, task)
+
+	// 先停看护、等它退出，再写回。反过来的话，续租可能在任务已经写成终态之后
+	// 才到达，因 status 不再是 running 而返回 ErrLeaseLost，凭空报出一条错误；
+	// 更糟的是它会把一个已经正常结束的任务标成"失租"。
+	close(stop)
+	<-watchDone
+
+	// 失租的判断必须排在停机前面：租约一旦易主，任务已归别的持有者，本次结果
+	// 无论成功与否都不能再写（写也只会被 fencing 拒掉）。任务保持 running，
+	// 交给回收器按新租约处理。
+	if cause := context.Cause(taskCtx); errors.Is(cause, ErrLeaseLost) {
+		w.report(fmt.Errorf(
+			"task %d lost its lease while running; leaving it to the reaper: %w", task.ID, cause))
+		return
+	}
 
 	// 停机进行中：这次失败是被取消掉的，不代表任务真的失败，不能写回
 	// （写回 pending 会让别的 Worker 在旧副作用可能仍在途时立刻重跑）。
@@ -291,6 +346,54 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 		return
 	}
 	w.ack(ctx, task)
+}
+
+// watchLease 为一条在途任务按 Config.HeartbeatInterval 续租，直到 stop 被关闭
+// （Handler 已结束）、taskCtx 被取消（停机），或确认失租。
+//
+// 确认失租（RenewLease 返回 ErrLeaseLost）时调用 cancelTask 取消 Handler 的
+// context：任务已经归别人了，本次执行的结果不再被接受，越早让 Handler 收手越好。
+//
+// **续租失败不等于失租**。只有 ErrLeaseLost 才说明租约没了；连接断开、语句超时
+// 这类错误只说明这次没问成，租约可能仍然有效，因此只上报并等下一个周期重试，
+// 绝不据此取消 Handler（需求文档 §9「数据库暂时不可用时记录错误、退避并继续」）。
+// 如果数据库真的长时间不可用，租约会自然过期，那时下一次续租才会返回 ErrLeaseLost。
+func (w *Worker) watchLease(ctx context.Context, stop <-chan struct{}, task ClaimedTask, cancelTask context.CancelCauseFunc) {
+	ticker := time.NewTicker(w.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			// 停机（或本任务已被取消）：停止续租，但**不释放租约**。
+			// 租约保持到自然过期，之后再交给回收器——需求文档 §4.6 要求
+			// 不提前把租约释放给其他 Worker。
+			return
+		case <-ticker.C:
+		}
+
+		// 单次续租自带一个心跳周期长度的预算：数据库卡住时看护协程不能无限期
+		// 阻塞在续租上，否则 process 在 Handler 返回后的收尾也会一起被卡住。
+		renewCtx, cancel := context.WithTimeout(ctx, w.cfg.HeartbeatInterval)
+		err := w.store.RenewLease(renewCtx, task, w.cfg.LeaseDuration)
+		cancel()
+
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrLeaseLost) {
+			cancelTask(fmt.Errorf("renew lease: %w", err))
+			return
+		}
+		// 停机打断的续租不是失租，也不值得上报：真驱动的续租语句会因为 ctx 已取消
+		// 而失败，那看上去像一条基础设施错误，实际只是停机的附带结果。
+		if ctx.Err() != nil {
+			return
+		}
+		w.report(fmt.Errorf("renew lease for task %d: %w", task.ID, err))
+	}
 }
 
 // ack 把一条执行成功的任务写回 succeeded 终态。
@@ -315,8 +418,10 @@ func (w *Worker) ack(ctx context.Context, task ClaimedTask) {
 // execute 解析 Handler 并在超时 context 下运行它。
 //
 // 超时取 task.Timeout（入队时持久化、领取时还原）；为 0 表示没设置，
-// 回落到 Worker 配置的 HandlerTimeout。runCtx 派生自 ctx，因此停机取消
-// 仍然能传到 Handler 手里——两者是同一套协作式取消，谁先到期谁生效。
+// 回落到 Worker 配置的 HandlerTimeout。runCtx 派生自 ctx（即本次执行的
+// taskCtx），因此停机、逐任务超时、失去租约这三种取消都能传到 Handler 手里
+// ——它们是同一套协作式取消，谁先发生谁生效，Handler 可用 context.Cause
+// 分辨自己是被谁叫停的。
 func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
 	handler, err := w.registry.Resolve(task.Type)
 	if err != nil {

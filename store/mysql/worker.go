@@ -95,6 +95,22 @@ const (
       AND lease_until > UTC_TIMESTAMP(6)`
 )
 
+// renewLeaseSQL 延长一条 running 任务的租约（技术设计 §5.3）。
+//
+// 新的 lease_until 从**数据库当前时间**起算，而不是在旧的 lease_until 上累加：
+// 续租表达的是"从我续租的这一刻起，再保证这么长时间"，累加会让租约随续租次数
+// 越推越远，一次失败的续租就能把任务锁住远超预期。
+//
+// WHERE 条件与三条状态写回完全一致（含 status='running'）：续租同样是一次
+// "凭租约说话"的操作，旧持有者必须在续租上也被挡住，否则一个已经失去租约的
+// Worker 可以靠续租把自己"续"回有效状态，fencing 就形同虚设。
+const renewLeaseSQL = `UPDATE ` + tasksTable + `
+    SET lease_until = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6)),
+        updated_at = UTC_TIMESTAMP(6)
+    WHERE id = ? AND status = 'running'
+      AND lease_owner = ? AND lease_epoch = ?
+      AND lease_until > UTC_TIMESTAMP(6)`
+
 // Claim 原子领取一批到期任务，实现 gorangetask.WorkerStore。
 //
 // 顺序是刻意的，分两段：
@@ -291,6 +307,33 @@ func (c *Client) MarkDead(ctx context.Context, task gorangetask.ClaimedTask, las
 		truncateRunes(lastError, maxLastErrorLen), int64(task.ID), task.Owner, task.Epoch)
 	if err != nil {
 		return fmt.Errorf("gorangetask/store/mysql: mark task dead: %w", err)
+	}
+	return checkLeaseAck(res, task)
+}
+
+// RenewLease 为一条在途任务续租，实现 gorangetask.WorkerStore。
+//
+// 新的 lease_until 由数据库时钟加上 leaseDuration 得到，不接受调用方传入的时刻
+// （技术设计 §3.2）；影响 0 行即 ErrLeaseLost。
+//
+// 注意区分两种失败：ErrLeaseLost 表示**本次执行已经不再持有租约**（租约过期、
+// 已易主、或任务已不在 running），调用方必须立刻停止该次执行且不得写回；
+// 而驱动错误（连接断开、超时）只说明"这次续租没问成"，租约可能仍然有效，
+// 必须原样冒泡而不是被翻译成 ErrLeaseLost —— 否则一次数据库抖动就会被误判成
+// "任务已被别人接手"，把还在正常执行的 Handler 无谓地半路掐掉。
+func (c *Client) RenewLease(ctx context.Context, task gorangetask.ClaimedTask, leaseDuration time.Duration) error {
+	if err := validateLease(task); err != nil {
+		return err
+	}
+	if leaseDuration <= 0 {
+		return fmt.Errorf("%w: lease duration must be > 0, got %s",
+			gorangetask.ErrInvalidConfig, leaseDuration)
+	}
+
+	res, err := c.db.ExecContext(ctx, renewLeaseSQL,
+		leaseDuration.Microseconds(), int64(task.ID), task.Owner, task.Epoch)
+	if err != nil {
+		return fmt.Errorf("gorangetask/store/mysql: renew lease of task %d: %w", task.ID, err)
 	}
 	return checkLeaseAck(res, task)
 }
