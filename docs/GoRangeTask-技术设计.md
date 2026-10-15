@@ -224,6 +224,8 @@ WHERE id = ? AND status = 'running'
 
 错误摘要截断至列长度，不保存完整堆栈或敏感 payload。Worker panic 由单任务边界 recover，转成可重试错误；进程级不可恢复错误不应被吞掉。
 
+recover 的具体口径（2026-10-15 实现时定）：**边界只包住 Handler 调用本身**，本库自己的领取、写回、回收逻辑若 panic 仍然照常崩——那是本库的 bug，不该被伪装成"某条任务失败"藏起来。转出的错误形如 `handler panicked: <值>`，并附一段**按行数截断**的堆栈（丢掉只说明"现在在跑"的首行 `goroutine N [running]:`，取前若干行，超出以 `...` 收尾）：堆栈不写全，但保住"是谁 panic 的"这部分最有用的信息。**不打永久标记**——需求只说"视为一次失败"，而 panic 未必是确定性的，去留交给 `max_attempts`。**局限**：只能捕获同一个 goroutine 里的 panic；Handler 若在自己起的子协程里 panic，Go 运行时会直接终止进程，这不是库能拦的。
+
 ### 5.6 过期租约回收
 
 Reaper 按小批次处理 `running AND lease_until <= UTC_TIMESTAMP(6)`：事务内 `SELECT id, attempt, max_attempts ... FOR UPDATE SKIP LOCKED`，逐行条件更新。
