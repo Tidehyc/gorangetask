@@ -35,6 +35,9 @@ func TestConfigZeroValueIsValidAfterDefaults(t *testing.T) {
 	if cfg.HeartbeatInterval != DefaultHeartbeatInterval {
 		t.Errorf("HeartbeatInterval = %s, want %s", cfg.HeartbeatInterval, DefaultHeartbeatInterval)
 	}
+	if cfg.ReapInterval != DefaultReapInterval {
+		t.Errorf("ReapInterval = %s, want %s", cfg.ReapInterval, DefaultReapInterval)
+	}
 	if cfg.ShutdownTimeout != DefaultShutdownTimeout {
 		t.Errorf("ShutdownTimeout = %s, want %s", cfg.ShutdownTimeout, DefaultShutdownTimeout)
 	}
@@ -73,6 +76,7 @@ func TestConfigDefaultsDoNotOverrideExplicitValues(t *testing.T) {
 		BatchSize:          5,
 		LeaseDuration:      time.Minute,
 		HeartbeatInterval:  20 * time.Second,
+		ReapInterval:       45 * time.Second,
 		ShutdownTimeout:    15 * time.Second,
 		HandlerTimeout:     2 * time.Minute,
 		MaxPayloadSize:     1024,
@@ -96,6 +100,24 @@ func TestConfigDefaultsDoNotOverrideExplicitValues(t *testing.T) {
 	}
 	if got.HandlerTimeout != 2*time.Minute || got.LeaseDuration != time.Minute {
 		t.Error("explicit duration values should not be overwritten")
+	}
+	// 回收间隔是有含义的负值开关之外唯一的可配项，默认值不得覆盖显式值。
+	if got.ReapInterval != 45*time.Second {
+		t.Errorf("ReapInterval = %s, want 45s: an explicit value must not be overwritten", got.ReapInterval)
+	}
+}
+
+// TestConfigReapIntervalNegativeDisables 固定"负值 = 关闭回收器"这条开关约定：
+// 它既是 WithDefaults 不能覆盖的值，也是 Validate 必须放行的值。
+func TestConfigReapIntervalNegativeDisables(t *testing.T) {
+	cfg := Config{ReapInterval: -1}.WithDefaults()
+
+	if cfg.ReapInterval != -1 {
+		t.Errorf("ReapInterval = %s after WithDefaults, want -1: 负值是有含义的开关，不能被默认值吃掉",
+			cfg.ReapInterval)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil: 负值表示关闭回收器，是合法配置", err)
 	}
 }
 
@@ -134,6 +156,7 @@ func TestConfigValidateRejectsInvalid(t *testing.T) {
 			c.LeaseDuration = 5 * time.Second
 			c.HeartbeatInterval = 10 * time.Second
 		}},
+		{"zero reap interval", func(c *Config) { c.ReapInterval = 0 }},
 		{"zero shutdown timeout", func(c *Config) { c.ShutdownTimeout = 0 }},
 		{"zero handler timeout", func(c *Config) { c.HandlerTimeout = 0 }},
 		{"zero max payload", func(c *Config) { c.MaxPayloadSize = 0 }},

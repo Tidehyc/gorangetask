@@ -29,6 +29,16 @@ type fakeStore struct {
 	retryErr   error
 	deadErr    error
 
+	// reapLimits 记录回收器的每次调用（存 limit）。回收的语义验证放在
+	// store/mysql 的真库用例里；根包这一层只需要一个能观察"回收协程有没有按
+	// 节奏跑起来、有没有被配置关掉、出错后还在不在"的缝隙。
+	reapLimits []int
+	reapErr    error
+
+	// onReap 在记录完一次回收调用后执行，供用例做同步点，或制造"回收恰好在
+	// 停机瞬间失败"这类只在特定时序下出现的路径。
+	onReap func(ctx context.Context, call int, limit int)
+
 	// onSucceed 在成功确认后被调用（用于测试里等待异步处理完成）。
 	onSucceed func(TaskID)
 
@@ -143,6 +153,25 @@ func (f *fakeStore) RenewLease(ctx context.Context, task ClaimedTask, _ time.Dur
 	return err
 }
 
+// ReapExpiredLeases 记录一次回收调用，并调用 onReap 供用例同步。
+// 回收的返回计数在这里恒为零值：根包并不解释它，只是把它交给调用方。
+func (f *fakeStore) ReapExpiredLeases(ctx context.Context, limit int) (ReapResult, error) {
+	if err := f.ctxErr(ctx); err != nil {
+		return ReapResult{}, err
+	}
+
+	f.mu.Lock()
+	f.reapLimits = append(f.reapLimits, limit)
+	call := len(f.reapLimits)
+	hook, err := f.onReap, f.reapErr
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook(ctx, call, limit)
+	}
+	return ReapResult{}, err
+}
+
 // noteWriteBack 记录一次状态写回，并检查它是否与续租重叠：
 // process 必须"先停看护、再写回"，重叠就说明这个顺序被破坏了。
 func (f *fakeStore) noteWriteBack() {
@@ -191,6 +220,13 @@ func (f *fakeStore) renewCalls() []ClaimedTask {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]ClaimedTask(nil), f.renewals...)
+}
+
+// reaped 返回回收器每次调用时传下去的 limit。
+func (f *fakeStore) reaped() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.reapLimits...)
 }
 
 func (f *fakeStore) wroteBackWhileRenewing() bool {
@@ -1537,5 +1573,318 @@ func TestWorkerDoesNotReportRenewalsCutShortByShutdown(t *testing.T) {
 	}
 	if n := len(store.deadCalls()); n != 0 {
 		t.Errorf("marked %d dead, want 0", n)
+	}
+}
+
+// waitUntil 轮询 cond 直到成立或超时。
+//
+// 回收器由定时器驱动，断言"它已经跑过至少 n 轮"时不能赌某一次调度的时序，
+// 轮询可以让用例在快机器上立刻通过、在慢机器上也不假失败。
+func waitUntil(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+// waitRun 等待 Run 返回。超时即判失败，避免用例挂死（挂死只能靠
+// go test -timeout 兜底，排查成本高得多）。
+func waitRun(t *testing.T, runDone <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-runDone:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return")
+		return nil
+	}
+}
+
+// TestWorkerReapsOnConfiguredInterval 证明回收协程真的按 ReapInterval 跑起来了，
+// 且以 reapBatchSize 为批量上限。"起了个协程"如果只写在注释里，是没法被检验的。
+func TestWorkerReapsOnConfiguredInterval(t *testing.T) {
+	store := &fakeStore{}
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	// 等到第二轮：只等到一轮无法区分"按周期跑"和"启动时跑了一次"。
+	waitUntil(t, 5*time.Second, "the reaper never ran", func() bool {
+		return len(store.reaped()) >= 2
+	})
+
+	cancel()
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil after a clean shutdown", err)
+	}
+
+	for _, limit := range store.reaped() {
+		if limit != reapBatchSize {
+			t.Errorf("reap limit = %d, want reapBatchSize (%d)", limit, reapBatchSize)
+		}
+	}
+}
+
+// TestWorkerReaperKeepsGoingAfterInfrastructureErrors 固定"回收能力不能被一次
+// 数据库抖动关掉"这条约定——它正是停机遗留任务唯一的下家。
+func TestWorkerReaperKeepsGoingAfterInfrastructureErrors(t *testing.T) {
+	store := &fakeStore{reapErr: errors.New("reap exploded")}
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	// 等到第二次：失败之后还能来第二次，才说明循环没被这次错误终结。
+	waitUntil(t, 5*time.Second, "the reaper stopped after an infrastructure error", func() bool {
+		return len(store.reaped()) >= 2
+	})
+
+	cancel()
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "reap expired leases") {
+			return
+		}
+	}
+	t.Errorf("the reap failure was never reported, got %v", reported)
+}
+
+// TestWorkerReaperCanBeDisabled 对照验证 ReapInterval 的负值确实关掉了回收。
+//
+// 只断言"没跑"是不够的——那也可能是协程起来了但还没来得及跑。所以两个子用例共用
+// 同一个时间窗，让"正间隔至少跑了两轮"给"负间隔一轮都没跑"提供参照。
+func TestWorkerReaperCanBeDisabled(t *testing.T) {
+	const (
+		interval = 5 * time.Millisecond
+		window   = 60 * time.Millisecond
+	)
+
+	countReaps := func(t *testing.T, reapInterval time.Duration) int {
+		t.Helper()
+		store := &fakeStore{}
+		cfg := fastConfig()
+		cfg.ReapInterval = reapInterval
+
+		w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+		if err != nil {
+			t.Fatalf("NewWorker() unexpected error: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runDone := make(chan error, 1)
+		go func() { runDone <- w.Run(ctx) }()
+
+		time.Sleep(window)
+		cancel()
+		if err := waitRun(t, runDone); err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+		return len(store.reaped())
+	}
+
+	if enabled := countReaps(t, interval); enabled < 2 {
+		t.Fatalf("reaped %d time(s) in %s with a %s interval; the reaper is not running",
+			enabled, window, interval)
+	}
+	if disabled := countReaps(t, -1); disabled != 0 {
+		t.Errorf("reaped %d time(s) with ReapInterval = -1, want 0", disabled)
+	}
+}
+
+// TestWorkerShutdownTimeoutBlamesTheReaper 覆盖"Handler 都退了、只有回收器没停"。
+// 超时消息必须说清是哪一边没停，否则排查时会被误导到 Handler 上。
+func TestWorkerShutdownTimeoutBlamesTheReaper(t *testing.T) {
+	reapEntered := make(chan struct{}, 1)
+	releaseReap := make(chan struct{})
+	t.Cleanup(func() { close(releaseReap) })
+
+	store := &fakeStore{}
+	store.onReap = func(context.Context, int, int) {
+		select {
+		case reapEntered <- struct{}{}:
+		default:
+		}
+		<-releaseReap // 故意无视 ctx 的回收调用
+	}
+
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-reapEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reaper never entered a reap call")
+	}
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrShutdownTimeout) {
+			t.Fatalf("Run() = %v, want ErrShutdownTimeout", err)
+		}
+		if !strings.Contains(err.Error(), "the reaper not stopped") {
+			t.Errorf("Run() error %q should blame the reaper, not the handlers", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return")
+	}
+}
+
+// TestWorkerShutdownTimeoutBlamesBothSides 覆盖"Handler 与回收器都没停"：
+// 这是停机超时里最难查的一种，消息必须把两边都点出来。
+func TestWorkerShutdownTimeoutBlamesBothSides(t *testing.T) {
+	handlerEntered := make(chan struct{}, 1)
+	reapEntered := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	releaseReap := make(chan struct{})
+	t.Cleanup(func() { close(releaseHandler); close(releaseReap) })
+
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(61, "t", 1, 3)}}}
+	store.onReap = func(context.Context, int, int) {
+		select {
+		case reapEntered <- struct{}{}:
+		default:
+		}
+		<-releaseReap
+	}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		select {
+		case handlerEntered <- struct{}{}:
+		default:
+		}
+		<-releaseHandler // 无视 ctx 的 Handler
+		return errors.New("released after the worker gave up")
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+	cfg.ShutdownTimeout = 50 * time.Millisecond
+
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	for name, ch := range map[string]<-chan struct{}{"handler": handlerEntered, "reaper": reapEntered} {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s never started", name)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrShutdownTimeout) {
+			t.Fatalf("Run() = %v, want ErrShutdownTimeout", err)
+		}
+		if !strings.Contains(err.Error(), "handlers still running and the reaper not stopped") {
+			t.Errorf("Run() error %q should blame both sides", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return")
+	}
+}
+
+// TestWorkerDoesNotReportReapFailuresCausedByShutdown 覆盖"回收恰好在停机瞬间
+// 失败"：驱动会因为 ctx 已取消而报错，那看上去像一条基础设施故障，实际只是停机
+// 的附带结果，不该被上报（与 watchLease 对续租的处理一致）。
+func TestWorkerDoesNotReportReapFailuresCausedByShutdown(t *testing.T) {
+	store := &fakeStore{reapErr: errors.New("reap exploded")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 让回收在"ctx 刚好被取消"的瞬间失败，这正是停机打断基础设施调用的样子。
+	store.onReap = func(context.Context, int, int) { cancel() }
+
+	cfg := fastConfig()
+	cfg.ReapInterval = 5 * time.Millisecond
+
+	w, err := NewWorker(store, newRegistryWith(t, "t"), cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var reported []error
+	w.onError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reported = append(reported, err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	if err := waitRun(t, runDone); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+
+	// 反向确认这条用例不是空转：回收确实被调用过。
+	if n := len(store.reaped()); n == 0 {
+		t.Fatal("the reaper never ran; this case would pass vacuously")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, err := range reported {
+		if strings.Contains(err.Error(), "reap expired leases") {
+			t.Errorf("a reap failure caused by shutdown was reported as infrastructure trouble: %v", err)
+		}
 	}
 }

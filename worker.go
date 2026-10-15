@@ -57,6 +57,17 @@ type ClaimSpec struct {
 	LeaseDuration time.Duration
 }
 
+// ReapResult 是一次过期租约回收的结果计数。
+//
+// 两个计数都保留：回收是"进程崩溃之后任务还能不能继续"的唯一保障，而这种动作
+// 平时是静默的——没有计数的话，出问题时几乎无从观察它到底有没有在工作。
+type ReapResult struct {
+	// ToPending 是被交还队列、等待重新领取的任务数。
+	ToPending int
+	// ToDead 是尝试次数已耗尽、被直接判为死信的任务数。
+	ToDead int
+}
+
 // WorkerStore 是 Worker 执行闭环所依赖的存储能力。
 //
 // 根包只通过这个接口做领取与确认，不直接书写 SQL；方言实现（如
@@ -93,6 +104,18 @@ type WorkerStore interface {
 
 	// MarkDead 把任务写入死信终态（不再自动重试），并记录错误摘要。
 	MarkDead(ctx context.Context, task ClaimedTask, lastError string) error
+
+	// ReapExpiredLeases 回收一批"仍标记为 running、但租约已经过期"的任务：
+	// 尝试次数未耗尽的交还队列（写回 pending），次数已耗尽的判为 dead。
+	// limit 是本次最多处理的行数，必须大于 0。
+	//
+	// 调用者不是任何一条任务的租约持有者，因此它没有 owner/epoch 这类凭据可比。
+	// 实现必须以"选行时读到的租约仍然未变"作为写回守卫；竞争导致影响 0 行时
+	// **跳过该行继续，不算错误** —— ErrLeaseLost 是租约持有者的错误语义，
+	// 这里借用它会让"有别的回收器同时在跑"看起来像故障。
+	//
+	// 回收只改状态，绝不执行 Handler。
+	ReapExpiredLeases(ctx context.Context, limit int) (ReapResult, error)
 }
 
 // Worker 从队列领取任务、调用 Handler、再把结果写回存储。
@@ -111,6 +134,7 @@ type WorkerStore interface {
 //   - 优雅停机（§3「Worker graceful shutdown」）：见 Run 的说明。
 //   - 租约续期与失租取消（§4「租约续期」「lease 丢失取消 context」）：见下方
 //     「本次执行的三条取消路径」。
+//   - 过期租约回收（§4「过期租约回收」）：见下方「过期租约回收器」。
 //
 // # 本次执行的三条取消路径
 //
@@ -127,13 +151,29 @@ type WorkerStore interface {
 // 取消始终是**协作式**的：它不会回滚 Handler 已经造成的业务副作用，只是通知
 // Handler 尽快收手。Handler 必须在长耗时操作中观察 ctx。
 //
+// # 过期租约回收器
+//
+// Run 还会起一个回收协程，按 Config.ReapInterval 把"持有者已经消失、租约也已
+// 过期"的任务交还队列或判为死信。它是**进程崩溃、停机超时、Handler 不理会取消**
+// 这三种情况的唯一出口：这三种情况都会留下一条永远 running 的任务，而租约是其中
+// 唯一会自然过期的凭据。
+//
+// 它有两条刻意的性质：
+//   - **不写回任何业务结果**：回收只把状态从 running 挪走，不执行 Handler，也
+//     不替任何任务确认成功或失败。
+//   - **失败不致命**：续租看护与回收器都遵循同一条规则——只有 ctx 取消才退出，
+//     驱动错误一律上报后等下一个周期重试。数据库抖一下不该让回收能力停摆。
+//
+// 集群里每个 Worker 都会回收，并发安全由存储层的 SKIP LOCKED 与租约值守卫保证
+// （见 WorkerStore.ReapExpiredLeases）。
+//
 // 尚未实现的语义（后续工作项，文档已排期）：
-//   - **回收器（§4）**：进程崩溃、停机超时、失租留下的 running 任务暂无人回收，
-//     只能等租约过期（目前没有任何组件会去捡它们）。
 //   - **指数退避与永久错误（§4）**：失败一律立即重试，不区分 Permanent，
 //     也不做退避；因此永久失败的任务会尝试到次数耗尽才进入 dead。
 //   - **panic 隔离（§4）**：Handler panic 会向上冒泡，尚未被单任务边界拦截。
-//   - **可观测性（§5）**：基础设施错误目前没有公开出口，只能通过内部 onError 观察。
+//   - **终态清理（§4）**：succeeded / dead / canceled 目前不会被删除。
+//   - **可观测性（§5）**：基础设施错误目前没有公开出口，只能通过内部 onError 观察；
+//     ReapResult 的两个计数也还没有消费方。
 type Worker struct {
 	store    WorkerStore
 	registry *Registry
@@ -192,6 +232,9 @@ func NewWorker(store WorkerStore, registry *Registry, cfg Config) (*Worker, erro
 //  3. **在 ShutdownTimeout 内等待退出**：超时后 Run 不再等待，返回
 //     ErrShutdownTimeout；没退回的 Handler 连同它们的任务一起被放弃。
 //
+// 回收协程也在同一步被等停。它不持有任何任务、随时可以放手，所以它几乎总是立刻
+// 返回；把它一起纳管只是为了不留一条"Run 已经返回、却还有协程在改库"的尾巴。
+//
 // 停机期间**不写回失败**。Handler 因停机被取消而返回的错误不代表任务真的失败；
 // 把它写回 pending 会让另一个 Worker 立刻重跑，而旧 Handler 的业务副作用可能
 // 仍在途。因此这类任务保持 running，等租约自然过期后由回收器恢复
@@ -222,6 +265,18 @@ func (w *Worker) Run(ctx context.Context) error {
 		close(loopsDone)
 	}()
 
+	// 回收器的存亡只由 ctx 与配置决定，与在途 Handler 无关，所以单独一个信号。
+	// 关闭回收器时直接关掉它，下面的等待逻辑不必再分情况。
+	reapDone := make(chan struct{})
+	if w.reaperEnabled() {
+		go func() {
+			defer close(reapDone)
+			w.reapLoop(ctx)
+		}()
+	} else {
+		close(reapDone)
+	}
+
 	<-ctx.Done()
 
 	// 在途 Handler 拿到的 context 派生自 ctx，取消已经传到它们手里；这里只等
@@ -229,11 +284,32 @@ func (w *Worker) Run(ctx context.Context) error {
 	timer := time.NewTimer(w.cfg.ShutdownTimeout)
 	defer timer.Stop()
 
-	select {
-	case <-loopsDone:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("%w: %s elapsed with handlers still running", ErrShutdownTimeout, w.cfg.ShutdownTimeout)
+	// 两个信号分开观察，只为把超时原因说清楚：是 Handler 没退，还是回收器没停。
+	// 置 nil 后该 case 永久阻塞，等同于"这一边已经不用再等了"。
+	handlersStopped, reaperStopped := false, false
+	for !handlersStopped || !reaperStopped {
+		select {
+		case <-loopsDone:
+			handlersStopped, loopsDone = true, nil
+		case <-reapDone:
+			reaperStopped, reapDone = true, nil
+		case <-timer.C:
+			return fmt.Errorf("%w: %s elapsed with %s",
+				ErrShutdownTimeout, w.cfg.ShutdownTimeout, stillRunning(handlersStopped, reaperStopped))
+		}
+	}
+	return nil
+}
+
+// stillRunning 描述停机超时时还有哪一部分没停下来。
+func stillRunning(handlersStopped, reaperStopped bool) string {
+	switch {
+	case !handlersStopped && !reaperStopped:
+		return "handlers still running and the reaper not stopped"
+	case !handlersStopped:
+		return "handlers still running"
+	default:
+		return "the reaper not stopped"
 	}
 }
 
@@ -393,6 +469,51 @@ func (w *Worker) watchLease(ctx context.Context, stop <-chan struct{}, task Clai
 			return
 		}
 		w.report(fmt.Errorf("renew lease for task %d: %w", task.ID, err))
+	}
+}
+
+// reapBatchSize 是回收器每轮最多处理的行数。
+//
+// 刻意做成内部常量而不是配置字段：它调的是"回收事务有多长"，属于实现细节；
+// 使用方真正关心的是多久捡一次（Config.ReapInterval）。真需要调整时再提上来。
+const reapBatchSize = 100
+
+// reaperEnabled 报告本 Worker 是否承担过期租约回收职责。
+//
+// 约定是"负值关闭，0 表示用默认值"：NewWorker 会先跑 WithDefaults，因此走到
+// 这里 ReapInterval 不可能是 0（Validate 也拒绝 0），大于 0 即开启。
+func (w *Worker) reaperEnabled() bool {
+	return w.cfg.ReapInterval > 0
+}
+
+// reapLoop 按 Config.ReapInterval 周期回收过期租约，直到 ctx 取消。
+//
+// 与 watchLease 遵循同一条原则：**只有 ctx 取消才退出**。驱动错误一律上报后
+// 等下一个周期重试——回收能力要是能被一次数据库抖动关掉，崩溃遗留的任务就会
+// 一直挂在 running 上没人管，而它正是这个循环存在的理由。
+func (w *Worker) reapLoop(ctx context.Context) {
+	ticker := time.NewTicker(w.cfg.ReapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		result, err := w.store.ReapExpiredLeases(ctx, reapBatchSize)
+		if err != nil {
+			// ctx 取消导致的失败是停机的附带结果，不是基础设施故障，不必上报。
+			if ctx.Err() != nil {
+				return
+			}
+			w.report(fmt.Errorf("reap expired leases: %w", err))
+			continue
+		}
+		// 计数暂时没有消费方：Worker 目前没有日志出口，§5「结构化日志」接进来
+		// 时这两个数会成为最有价值的一条。真库测试会直接断言它们。
+		_ = result
 	}
 }
 

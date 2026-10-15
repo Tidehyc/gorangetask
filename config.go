@@ -36,6 +36,10 @@ const (
 	// DefaultHeartbeatInterval 是租约续期周期。默认取租约时长的 1/3。
 	DefaultHeartbeatInterval = 10 * time.Second
 
+	// DefaultReapInterval 是过期租约回收器的运行间隔。默认与租约时长同量级：
+	// 一个进程崩溃后，它的任务最坏要等"租约到期 + 一个回收周期"才会被重新领取。
+	DefaultReapInterval = 30 * time.Second
+
 	// DefaultShutdownTimeout 是优雅停机时等待运行中 Handler 退出的上限。
 	DefaultShutdownTimeout = 30 * time.Second
 
@@ -94,6 +98,16 @@ type Config struct {
 	// HeartbeatInterval 是租约续期周期，必须大于 0 且小于 LeaseDuration。
 	HeartbeatInterval time.Duration
 
+	// ReapInterval 是过期租约回收器的运行间隔，不得为 0。
+	//
+	// 回收器负责把"持有者已经没了、租约也已过期"的 running 任务重新交还队列
+	// （次数未耗尽）或判为死信（次数已耗尽）。它是进程崩溃、停机超时、失租之后
+	// 任务仍能继续的唯一保障，所以默认开启。
+	//
+	// **负值表示关闭回收器**（该 Worker 不承担回收职责）。0 会被 WithDefaults
+	// 填成 DefaultReapInterval，因此"不设置"与"关闭"是两个不同的表达。
+	ReapInterval time.Duration
+
 	// ShutdownTimeout 是优雅停机等待运行中 Handler 退出的上限，必须大于 0。
 	ShutdownTimeout time.Duration
 
@@ -145,6 +159,10 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	// 只填 0：负值是有含义的（关闭回收器），不能被默认值覆盖掉。
+	if c.ReapInterval == 0 {
+		c.ReapInterval = DefaultReapInterval
 	}
 	if c.ShutdownTimeout == 0 {
 		c.ShutdownTimeout = DefaultShutdownTimeout
@@ -217,6 +235,12 @@ func (c Config) Validate() error {
 	// 心跳必须严格小于租约，否则续期来不及在租约到期前完成。
 	if c.HeartbeatInterval > 0 && c.LeaseDuration > 0 && c.HeartbeatInterval >= c.LeaseDuration {
 		errs = append(errs, fmt.Errorf("heartbeat interval (%s) must be < lease duration (%s)", c.HeartbeatInterval, c.LeaseDuration))
+	}
+
+	// 0 是"未设置"，WithDefaults 会填成默认值；走到这里还是 0 说明调用方
+	// 直接对零值配置调了 Validate，或显式传了 0。负值是合法的关闭开关。
+	if c.ReapInterval == 0 {
+		errs = append(errs, errors.New("reap interval must not be 0 (use a negative value to disable the reaper)"))
 	}
 
 	if c.ShutdownTimeout <= 0 {

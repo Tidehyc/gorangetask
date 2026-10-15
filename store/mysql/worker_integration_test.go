@@ -1693,6 +1693,696 @@ func TestShutdownLeavesCancelledTaskRunningForTheReaper(t *testing.T) {
 	}
 }
 
+// --- 过期租约回收（ReapExpiredLeases） --------------------------------------
+
+// 这个方法是"持有者已经消失"的唯一出口，所以用例的取向是把它**写回的每一个字段**
+// 和它**不动的每一个字段**都钉在真库上：静态字段错了会让恢复出来的任务带着脏状态
+// 重新执行，而"没被碰"的那一侧错了会让还有活人的租约被抢走、造成并行执行。
+
+// enqueueForReap 造一条待回收场景用的任务。
+func enqueueForReap(t *testing.T, c *Client, queue string, maxAttempts int) gorangetask.TaskID {
+	t.Helper()
+
+	id, err := c.Enqueue(context.Background(), gorangetask.Task{
+		Queue:       queue,
+		Type:        "email.send",
+		Payload:     json.RawMessage(`{"to":"a@example.com"}`),
+		MaxAttempts: maxAttempts,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	return id
+}
+
+// leaseUntilLiteral 读出某行 lease_until 的 DATETIME(6) 字面量，取值方式与回收器
+// 内部完全一致（DATE_FORMAT），供守卫用例原样带回去做等值比较。
+func leaseUntilLiteral(t *testing.T, db *sql.DB, id gorangetask.TaskID) string {
+	t.Helper()
+
+	var lit string
+	err := db.QueryRowContext(context.Background(),
+		"SELECT DATE_FORMAT(lease_until, '%Y-%m-%d %H:%i:%s.%f') FROM "+tasksTable+" WHERE id = ?",
+		int64(id)).Scan(&lit)
+	if err != nil {
+		t.Fatalf("read lease_until literal of task %d: %v", id, err)
+	}
+	return lit
+}
+
+// execReapPendingSQL 直接执行产品的"回收回 pending"语句，返回影响行数。
+func execReapPendingSQL(t *testing.T, db *sql.DB, id gorangetask.TaskID, leaseLiteral string) int64 {
+	t.Helper()
+
+	res, err := db.ExecContext(context.Background(), reapToPendingSQL, reapPendingError, int64(id), leaseLiteral)
+	if err != nil {
+		t.Fatalf("exec reap-to-pending for task %d: %v", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("rows affected for task %d: %v", id, err)
+	}
+	return affected
+}
+
+func countTasksWithStatus(t *testing.T, db *sql.DB, status string) int {
+	t.Helper()
+
+	var n int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM "+tasksTable+" WHERE status = ?", status).Scan(&n); err != nil {
+		t.Fatalf("count tasks with status %q: %v", status, err)
+	}
+	return n
+}
+
+// TestReapReturnsExpiredTaskToPending 固定"次数未耗尽"这一支的完整结果。
+//
+// attempt 与 lease_epoch 都必须**不动**：这次领取已经用掉一次机会，回收只是给下
+// 一次让路；epoch 属于"领取"这个动作，回收不是一次领取。用例最后真的把它重新领
+// 出来，验证两个计数器是在领取时才各自 +1。
+func TestReapReturnsExpiredTaskToPending(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-pending"
+
+	id := enqueueForReap(t, c, queue, 5)
+	claimOnce(t, c, queue, "worker-a")
+	expireLease(t, db, id)
+
+	result, err := c.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 1 || result.ToDead != 0 {
+		t.Fatalf("ReapResult = %+v, want {ToPending:1 ToDead:0}", result)
+	}
+
+	row := readTask(t, db, id)
+	if row.status != "pending" {
+		t.Errorf("status = %q, want pending", row.status)
+	}
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1: 回收不动尝试次数", row.attempt)
+	}
+	if row.leaseEpoch != 1 {
+		t.Errorf("lease_epoch = %d, want 1: 回收不是一次领取，不推进代数", row.leaseEpoch)
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease = (owner %v, until %v), want both NULL", row.leaseOwner, row.leaseUntil)
+	}
+	if row.finishedAt.Valid {
+		t.Errorf("finished_at = %s, want NULL: 回到队列不是终态", row.finishedAt.Time)
+	}
+	if row.lastError.String != reapPendingError {
+		t.Errorf("last_error = %q, want %q", row.lastError.String, reapPendingError)
+	}
+	if row.runAt.After(dbNow(t, db)) {
+		t.Errorf("run_at = %s is still in the future; a reaped task must be claimable at once", row.runAt)
+	}
+
+	// 回收出来的任务必须真的能被再领一次，而且那才是 attempt/epoch 各自 +1 的时刻。
+	again := claimOnce(t, c, queue, "worker-b")
+	if again.ID != id {
+		t.Fatalf("re-claimed id = %d, want %d", again.ID, id)
+	}
+	if again.Attempt != 2 || again.Epoch != 2 {
+		t.Errorf("re-claimed attempt/epoch = %d/%d, want 2/2", again.Attempt, again.Epoch)
+	}
+}
+
+// TestReapMarksExhaustedTaskDead 固定"次数已耗尽"这一支：任务进死信、写完成时间，
+// 且此后不再被领取（否则"次数上限"就形同虚设）。
+func TestReapMarksExhaustedTaskDead(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-dead"
+
+	// MaxAttempts = 1：领取时 attempt 变成 1，已经用完了全部机会。
+	id := enqueueForReap(t, c, queue, 1)
+	claimOnce(t, c, queue, "worker-a")
+	expireLease(t, db, id)
+
+	result, err := c.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 0 || result.ToDead != 1 {
+		t.Fatalf("ReapResult = %+v, want {ToPending:0 ToDead:1}", result)
+	}
+
+	row := readTask(t, db, id)
+	if row.status != "dead" {
+		t.Errorf("status = %q, want dead", row.status)
+	}
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1: 回收不动尝试次数", row.attempt)
+	}
+	if !row.finishedAt.Valid {
+		t.Error("finished_at is NULL, want a timestamp: 死信是终态")
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease = (owner %v, until %v), want both NULL", row.leaseOwner, row.leaseUntil)
+	}
+	if row.lastError.String != reapDeadError {
+		t.Errorf("last_error = %q, want %q", row.lastError.String, reapDeadError)
+	}
+
+	tasks, err := c.Claim(ctx, gorangetask.ClaimSpec{
+		Queue: queue, Limit: 10, Owner: "worker-b", LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("Claim returned %d task(s), want 0: 死信不该被重新领取", len(tasks))
+	}
+}
+
+// TestReapLeavesUnexpiredLeasesAlone 是这套用例里最要紧的一条：回收器绝不能碰
+// 租约还有效的行，否则它会把一个正在执行的任务抢走，直接造成并行执行。
+//
+// 用 updated_at 是否变化来判断"有没有被碰过"——只断言 status 不变是不够的，
+// 一次"改了又改回去"的更新同样会破坏租约。
+func TestReapLeavesUnexpiredLeasesAlone(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-unexpired"
+
+	id := enqueueForReap(t, c, queue, 5)
+	claimed := claimOnce(t, c, queue, "worker-a") // 租约 30s，远未过期
+	before := readTask(t, db, id)
+
+	result, err := c.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 0 || result.ToDead != 0 {
+		t.Fatalf("ReapResult = %+v, want zero: 租约还有效，回收器不该动手", result)
+	}
+
+	after := readTask(t, db, id)
+	if after.status != "running" {
+		t.Errorf("status = %q, want running", after.status)
+	}
+	if after.leaseOwner.String != claimed.Owner || uint64(after.leaseEpoch) != claimed.Epoch {
+		t.Errorf("lease owner/epoch = %q/%d, want %q/%d",
+			after.leaseOwner.String, after.leaseEpoch, claimed.Owner, claimed.Epoch)
+	}
+	if !after.leaseUntil.Valid || !after.leaseUntil.Time.Equal(before.leaseUntil.Time) {
+		t.Errorf("lease_until = %v, want it unchanged (%v)", after.leaseUntil, before.leaseUntil.Time)
+	}
+	if !after.updatedAt.Equal(before.updatedAt) {
+		t.Errorf("updated_at moved from %s to %s: 未过期的行被碰过了", before.updatedAt, after.updatedAt)
+	}
+}
+
+// TestReapIgnoresNonRunningTasks 把 status 这一层挡住的事钉下来：五种状态各造一行，
+// **每一行**的 lease_until 都改成过去——这样"没被回收"就不能用"租约还没到期"解释，
+// 只能是 status 起的作用。
+//
+// 每种状态各占一个队列：领取的语义是"从该队列里挑 run_at 最早的一条"，同一个队列
+// 里连着造几条会让后面的 claimOnce 领走前面那条，状态与 id 会整体错位。
+func TestReapIgnoresNonRunningTasks(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-status"
+
+	pendingID := enqueueForReap(t, c, queue+"-pending", 5)
+
+	runningID := enqueueForReap(t, c, queue+"-running", 5)
+	claimOnce(t, c, queue+"-running", "worker-a")
+
+	succeededID := enqueueForReap(t, c, queue+"-succeeded", 5)
+	succeeded := claimOnce(t, c, queue+"-succeeded", "worker-a")
+	if err := c.Succeed(ctx, succeeded); err != nil {
+		t.Fatalf("Succeed: %v", err)
+	}
+
+	canceledID := enqueueForReap(t, c, queue+"-canceled", 5)
+	if err := c.Cancel(ctx, canceledID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	deadID := enqueueForReap(t, c, queue+"-dead", 1)
+	dead := claimOnce(t, c, queue+"-dead", "worker-a")
+	if err := c.MarkDead(ctx, dead, "handler gave up"); err != nil {
+		t.Fatalf("MarkDead: %v", err)
+	}
+
+	type want struct {
+		id     gorangetask.TaskID
+		status string
+	}
+	rows := []want{
+		{pendingID, "pending"},
+		{runningID, "running"},
+		{succeededID, "succeeded"},
+		{canceledID, "canceled"},
+		{deadID, "dead"},
+	}
+
+	// 把每一行的租约都改成过去，让 status 成为唯一的解释。
+	updated := make(map[gorangetask.TaskID]time.Time, len(rows))
+	for _, r := range rows {
+		expireLease(t, db, r.id)
+		updated[r.id] = readTask(t, db, r.id).updatedAt
+	}
+
+	// 只把 running 那行的租约恢复成"刚刚过期"是做不到的（它本来就已经过期），
+	// 所以这里直接调用回收器：唯一该被回收的就是 running 那一行。
+	result, err := c.ReapExpiredLeases(ctx, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 1 || result.ToDead != 0 {
+		t.Fatalf("ReapResult = %+v, want only the running row reaped", result)
+	}
+
+	for _, r := range rows {
+		row := readTask(t, db, r.id)
+		wantStatus := r.status
+		if r.id == runningID {
+			// 唯一被回收的那一行：过期 + 次数未耗尽 ⇒ 回到队列。
+			wantStatus = "pending"
+		}
+		if row.status != wantStatus {
+			t.Errorf("task %d status = %q, want %q", r.id, row.status, wantStatus)
+		}
+		if r.id == runningID {
+			continue
+		}
+		if !row.updatedAt.Equal(updated[r.id]) {
+			t.Errorf("task %d (%s) was touched by the reaper: updated_at %s -> %s",
+				r.id, r.status, updated[r.id], row.updatedAt)
+		}
+	}
+}
+
+// TestReapGuardRejectsStaleLeaseValue 固定写回守卫的语义：用**读到的那个
+// lease_until 原值**做等值比较，续租之后旧值不再命中。
+//
+// 为什么值得单独测：真实调用链里这一行被 FOR UPDATE 锁着，没人能在这中间改动它，
+// 所以守卫是第二道防线。但它是"判错了就静默什么都不做"的地方——万一 DATE_FORMAT
+// 出来的字面量与列值对不上，回收器会一声不响地永远回收不了任何任务，而所有
+// "不该被回收的行没被回收"的断言照样全绿。这里用产品语句验证它"该命中时命中、
+// 续租之后不命中"，把这个静默失败的可能性关掉。
+func TestReapGuardRejectsStaleLeaseValue(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-guard"
+
+	id := enqueueForReap(t, c, queue, 5)
+	claimed := claimOnce(t, c, queue, "worker-a")
+	original := leaseUntilLiteral(t, db, id)
+
+	// 续租：lease_until 换成未来。守卫拿的是续租前的旧值，必须一行都不改。
+	if err := c.RenewLease(ctx, claimed, time.Hour); err != nil {
+		t.Fatalf("RenewLease: %v", err)
+	}
+	renewed := leaseUntilLiteral(t, db, id)
+	if renewed == original {
+		t.Fatalf("lease_until did not change after a renewal (%s)", renewed)
+	}
+	if n := execReapPendingSQL(t, db, id, original); n != 0 {
+		t.Errorf("rows affected with the pre-renewal lease value = %d, want 0", n)
+	}
+	row := readTask(t, db, id)
+	if row.status != "running" || leaseUntilLiteral(t, db, id) != renewed {
+		t.Errorf("a renewed lease was disturbed: status = %q, lease_until = %s",
+			row.status, leaseUntilLiteral(t, db, id))
+	}
+
+	// 让租约过期：此时拿续租后的值做守卫就必须命中。
+	expireLease(t, db, id)
+	expired := leaseUntilLiteral(t, db, id)
+	if n := execReapPendingSQL(t, db, id, renewed); n != 0 {
+		t.Errorf("rows affected with the pre-expiry lease value = %d, want 0", n)
+	}
+	if n := execReapPendingSQL(t, db, id, expired); n != 1 {
+		t.Fatalf("rows affected with the current (expired) lease value = %d, want 1", n)
+	}
+
+	row = readTask(t, db, id)
+	if row.status != "pending" || row.lastError.String != reapPendingError {
+		t.Errorf("after the guard matched: status = %q, last_error = %q; want pending / %q",
+			row.status, row.lastError.String, reapPendingError)
+	}
+}
+
+// TestReapRespectsLimit 固定 limit 是"最多处理几行"：剩下的留到下一轮。
+func TestReapRespectsLimit(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-limit"
+
+	for i := 0; i < 3; i++ {
+		id := enqueueForReap(t, c, queue, 5)
+		claimOnce(t, c, queue, "worker-a")
+		expireLease(t, db, id)
+	}
+
+	result, err := c.ReapExpiredLeases(ctx, 2)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 2 || result.ToDead != 0 {
+		t.Fatalf("ReapResult = %+v, want {ToPending:2 ToDead:0}", result)
+	}
+	if n := countTasksWithStatus(t, db, "running"); n != 1 {
+		t.Errorf("%d task(s) still running, want 1: limit 之外的行要留给下一轮", n)
+	}
+
+	// 下一轮把剩下的收掉，证明它是"留到下一轮"而不是"漏掉"。
+	result, err = c.ReapExpiredLeases(ctx, 2)
+	if err != nil {
+		t.Fatalf("second ReapExpiredLeases: %v", err)
+	}
+	if result.ToPending != 1 {
+		t.Errorf("second ReapResult = %+v, want {ToPending:1}", result)
+	}
+	if n := countTasksWithStatus(t, db, "running"); n != 0 {
+		t.Errorf("%d task(s) still running after the second round", n)
+	}
+}
+
+// explainPlan 执行 EXPLAIN，取出计划里实际选用的索引与 Extra 备注。
+// 用于钉住"某条读必须走哪条索引"——这在本项目里是语义问题，不只是性能问题。
+func explainPlan(t *testing.T, db *sql.DB, query string, args ...any) (key, extra string) {
+	t.Helper()
+
+	rows, err := db.QueryContext(context.Background(), "EXPLAIN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("explain columns: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("explain returned no rows")
+	}
+	raw := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		t.Fatalf("explain scan: %v", err)
+	}
+	for i, name := range cols {
+		var s string
+		switch v := raw[i].(type) {
+		case []byte:
+			s = string(v)
+		case string:
+			s = v
+		}
+		switch name {
+		case "key":
+			key = s
+		case "Extra":
+			extra = s
+		}
+	}
+	return key, extra
+}
+
+// TestReapLockingReadStaysOnLeaseIndex 钉住回收器那条加锁读的**加锁范围**。
+//
+// 为什么值得单独一条用例：这条读要连带取回 attempt / max_attempts，而这两列不在
+// ix_gotask_lease 里，所以它不是覆盖索引。实测（MySQL 8.0.46，12 条过期任务）优化器
+// 会改选 `type=ALL, key=NULL, Using filesort`——全表扫描 + 排序。此时 FOR UPDATE 在
+// 扫描过程中就把整个积压锁住，LIMIT 不再限制加锁范围，SKIP LOCKED 也失去意义：
+//
+//	tx1（LIMIT 3）返回 [1 2 3]，data_locks 显示它在 PRIMARY 上锁了全部 12 行；
+//	tx2 执行同一条读返回 **0 行**，却同样把 ix_gotask_lease 上 12 条索引项全锁一遍。
+//
+// 后果是并发回收器互相把对方挡住，一轮下来只有一个能推进（12 条任务只回收 3 条），
+// 而且积压越大锁得越多。这不是"慢一点"，是"多回收器等于没并发"。修复办法是在 SQL 里
+// 显式 FORCE INDEX (ix_gotask_lease)，让计划稳定停在 lease 索引上（实测锁从 13 条降到 7 条）。
+//
+// 断言分两层，任一层被破坏都能立刻抓到：
+//
+//  1. 计划层：EXPLAIN 的 key 必须是 ix_gotask_lease。去掉 FORCE INDEX 后这一层先失败。
+//  2. 行为层：tx1 持有 limit 行的锁且未提交时，tx2 执行同一条读仍应拿到 limit 行、
+//     且与 tx1 不相交。去掉 FORCE INDEX 后 tx2 返回 0 行，这一层也失败。
+//
+// 刻意用两个手写事务而不是两个 Worker：要的是**确定性**复现"锁范围失控"，
+// 不能把这条用例的成败压在 goroutine 调度上。
+func TestReapLockingReadStaysOnLeaseIndex(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue = "q-reap-lock-scope"
+		tasks = 12
+		limit = 3
+	)
+
+	for i := 0; i < tasks; i++ {
+		id := enqueueForReap(t, c, queue, 5)
+		claimOnce(t, c, queue, "worker-a")
+		expireLease(t, db, id)
+	}
+
+	if key, extra := explainPlan(t, db, reapExpiredIDsSQL, limit); key != "ix_gotask_lease" {
+		t.Errorf("回收器加锁读选用的索引 = %q (Extra=%q), want ix_gotask_lease: "+
+			"计划一旦离开 lease 索引，FOR UPDATE 会把整个积压锁住", key, extra)
+	}
+
+	// 开事务、跑完加锁读后**不提交**：锁保留到用例结束（Cleanup 里 Rollback）。
+	lockAndRead := func(t *testing.T, label string) []gorangetask.TaskID {
+		t.Helper()
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("%s begin: %v", label, err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback() })
+
+		rows, err := tx.QueryContext(ctx, reapExpiredIDsSQL, limit)
+		if err != nil {
+			t.Fatalf("%s query: %v", label, err)
+		}
+		defer func() { _ = rows.Close() }()
+
+		var ids []gorangetask.TaskID
+		for rows.Next() {
+			var id int64
+			var attempt, maxAttempts int
+			var leaseUntil string
+			if err := rows.Scan(&id, &attempt, &maxAttempts, &leaseUntil); err != nil {
+				t.Fatalf("%s scan: %v", label, err)
+			}
+			ids = append(ids, gorangetask.TaskID(id))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("%s read rows: %v", label, err)
+		}
+		return ids
+	}
+
+	first := lockAndRead(t, "tx1")
+	if len(first) != limit {
+		t.Fatalf("tx1 选中 %d 行, want %d", len(first), limit)
+	}
+
+	second := lockAndRead(t, "tx2")
+	if len(second) != limit {
+		t.Errorf("tx1 已锁 %v 时 tx2 只选中 %d 行, want %d: "+
+			"加锁读越过了 LIMIT，把 tx1 之外的行也锁住了（SKIP LOCKED 失效）",
+			first, len(second), limit)
+	}
+
+	seen := make(map[gorangetask.TaskID]bool, limit)
+	for _, id := range first {
+		seen[id] = true
+	}
+	for _, id := range second {
+		if seen[id] {
+			t.Errorf("task %d 被两个加锁读同时选中：SKIP LOCKED 失效", id)
+		}
+	}
+}
+
+// TestReapIsSafeWithConcurrentReapers 验证多个回收器同时跑不会重复处理同一行。
+//
+// 断言分两层，和并发领取那套一致：进程侧看**回收总数恰好等于任务数**；库里再独立
+// 复核一次——全部落到 pending，且 lease_epoch 全为 1，说明没有任何一行被重新领取过。
+//
+// 每轮的 limit 刻意取 tasks/reapers：一个回收器一轮吃不下全部任务，凑够总数就必须
+// 几个回收器都真的干了活。若把 limit 放大到 tasks，实测会变成一个回收器抢走全部 12
+// 行、其余三个空手而归——那样断言照样全绿，却什么并发都没验证到（分布用 t.Logf
+// 记下来，不做断言：它取决于 goroutine 调度）。
+func TestReapIsSafeWithConcurrentReapers(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const (
+		queue   = "q-reap-concurrent"
+		tasks   = 12
+		reapers = 4
+	)
+
+	for i := 0; i < tasks; i++ {
+		id := enqueueForReap(t, c, queue, 5)
+		claimOnce(t, c, queue, "worker-a")
+		expireLease(t, db, id)
+	}
+
+	// barrier：让所有回收器在同一瞬间冲进去，把竞争窗口开到最大。
+	start := make(chan struct{})
+	results := make([]gorangetask.ReapResult, reapers)
+	errs := make([]error, reapers)
+
+	var wg sync.WaitGroup
+	wg.Add(reapers)
+	for i := 0; i < reapers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = c.ReapExpiredLeases(ctx, tasks/reapers)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	total := 0
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("reaper %d failed: %v", i, err)
+			continue
+		}
+		t.Logf("reaper %d reaped %+v", i, results[i])
+		total += results[i].ToPending + results[i].ToDead
+	}
+	if total != tasks {
+		t.Errorf("reapers reaped %d row(s) in total, want %d: 同一行被处理了两次或漏掉了", total, tasks)
+	}
+
+	var pending, running int
+	var maxEpoch int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT SUM(status = 'pending'), SUM(status = 'running'), MAX(lease_epoch) FROM "+tasksTable).
+		Scan(&pending, &running, &maxEpoch); err != nil {
+		t.Fatalf("summarize table: %v", err)
+	}
+	if pending != tasks || running != 0 {
+		t.Errorf("pending/running = %d/%d, want %d/0", pending, running, tasks)
+	}
+	if maxEpoch != 1 {
+		t.Errorf("max lease_epoch = %d, want 1: 有任务被重新领取过，说明回收重复处理了", maxEpoch)
+	}
+}
+
+// TestWorkerReapsTaskAbandonedByShutdown 是回收器的端到端验收：一个 Handler 不
+// 理会取消的 Worker 在停机后把任务留在 running，租约自然过期，另一个 Worker 把它
+// 捡回来跑完。这正是 §6「故障注入：claim 后退出」要的场景。
+//
+// 整个过程只靠产品路径，不手工改租约：Worker A 的续租看护随停机一起停掉，租约按
+// 配置的 LeaseDuration 自然过期。
+func TestWorkerReapsTaskAbandonedByShutdown(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+	const queue = "q-reap-e2e"
+
+	id := enqueueForReap(t, c, queue, 5)
+
+	// --- Worker A：Handler 无视 ctx，停机只能超时放弃，任务留在 running。 ---
+	// 必须等 Handler **真的进去了**再停机：只等库里的 status 变成 running 是不够的，
+	// claim 提交与 Handler 启动之间有个窗口，在那里停机会让 runOnce 按设计跳过整批
+	// （剩余任务不启动 Handler），于是 Run 干净返回 nil——那是正确行为，却会让这条
+	// 用例测不到它想测的东西。
+	handlerEntered := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	t.Cleanup(func() { close(releaseHandler) })
+
+	regA := gorangetask.NewRegistry()
+	mustRegister(t, regA, "email.send", func(context.Context, json.RawMessage) error {
+		select {
+		case handlerEntered <- struct{}{}:
+		default:
+		}
+		<-releaseHandler
+		return errors.New("released after worker A gave up")
+	})
+
+	cfgA := workerConfig(queue)
+	cfgA.LeaseDuration = time.Second
+	cfgA.HeartbeatInterval = 300 * time.Millisecond
+	cfgA.ShutdownTimeout = 100 * time.Millisecond
+
+	wA, err := gorangetask.NewWorker(c, regA, cfgA)
+	if err != nil {
+		t.Fatalf("NewWorker(A): %v", err)
+	}
+
+	ctxA, cancelA := context.WithCancel(ctx)
+	aDone := make(chan error, 1)
+	go func() { aDone <- wA.Run(ctxA) }()
+
+	waitForStatus(t, db, id, "running", 5*time.Second)
+	select {
+	case <-handlerEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker A never started the handler")
+	}
+	cancelA()
+	select {
+	case err := <-aDone:
+		if !errors.Is(err, gorangetask.ErrShutdownTimeout) {
+			t.Fatalf("worker A Run() = %v, want ErrShutdownTimeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker A did not return")
+	}
+	// A 停了，但任务还在 running —— 这正是回收器存在的理由。
+	if row := readTask(t, db, id); row.status != "running" {
+		t.Fatalf("task status = %q after A gave up, want running", row.status)
+	}
+
+	// --- Worker B：同一个库上的另一个 Worker，带着回收器，Handler 正常返回。 ---
+	regB := gorangetask.NewRegistry()
+	mustRegister(t, regB, "email.send", func(_ context.Context, payload json.RawMessage) error {
+		mustDecode(t, payload)
+		return nil
+	})
+
+	cfgB := workerConfig(queue)
+	cfgB.LeaseDuration = time.Second
+	cfgB.HeartbeatInterval = 300 * time.Millisecond
+	cfgB.ReapInterval = 20 * time.Millisecond
+
+	wB, err := gorangetask.NewWorker(c, regB, cfgB)
+	if err != nil {
+		t.Fatalf("NewWorker(B): %v", err)
+	}
+
+	ctxB, cancelB := context.WithCancel(ctx)
+	defer cancelB()
+	bDone := make(chan error, 1)
+	go func() { bDone <- wB.Run(ctxB) }()
+
+	row := waitForStatus(t, db, id, "succeeded", 20*time.Second)
+	if row.attempt != 2 {
+		t.Errorf("attempt = %d, want 2: 回收后的那次重新领取应该再计一次尝试", row.attempt)
+	}
+	if row.leaseEpoch != 2 {
+		t.Errorf("lease_epoch = %d, want 2: 两次领取 ⇒ 两个代数", row.leaseEpoch)
+	}
+
+	cancelB()
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("worker B Run() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker B did not return")
+	}
+}
+
 // --- 小工具 ---------------------------------------------------------------
 
 func mustDecode(t *testing.T, raw json.RawMessage) any {

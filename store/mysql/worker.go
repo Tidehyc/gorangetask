@@ -111,6 +111,72 @@ const renewLeaseSQL = `UPDATE ` + tasksTable + `
       AND lease_owner = ? AND lease_epoch = ?
       AND lease_until > UTC_TIMESTAMP(6)`
 
+// 回收器写回的错误摘要。用固定文案而不是拼接原错误：回收器手上没有别的信息，
+// 它唯一能说明的就是"这个持有者没能确认自己的结果，租约已经过期"。
+const (
+	reapPendingError = "lease expired"
+	reapDeadError    = "lease expired at final attempt"
+)
+
+// reapExpiredIDsSQL 选出"仍标记为 running、但租约已经过期"的任务，并连带取回
+// 分流所需的 attempt / max_attempts。
+//
+// 走 ix_gotask_lease (status, lease_until, id)：前缀正是 status，因此这条扫描
+// 只落在"已过期"的那一段上。加锁读同样用 SKIP LOCKED —— 集群里每个 Worker 都会
+// 跑回收器，彼此跳过已锁定的行即可，不需要额外协调。
+//
+// FORCE INDEX 是**必需的，不是优化**。这里取出的 attempt / max_attempts 不在
+// ix_gotask_lease 里，于是这条读不是覆盖索引；实测（MySQL 8.0.46，12 行过期任务）
+// 优化器会选 `type=ALL, key=NULL, Using filesort`，即全表扫描 + 排序：
+//
+//	EXPLAIN -> type=ALL key=NULL Extra=Using where; Using filesort
+//	tx1（LIMIT 3）SELECT -> [1 2 3]
+//	但 data_locks 显示 tx1 在 PRIMARY 上锁了**全部 12 行**；
+//	再开一个 tx2 执行同一条读，它返回 **0 行**，却同样把 ix_gotask_lease 上
+//	12 条索引项全锁了一遍（每个回收器都会把整个积压锁住）。
+//
+// 也就是说 LIMIT 不再限制加锁范围，SKIP LOCKED 也失去意义：并发回收器互相
+// 把对方挡住，一轮下来只有一个能推进。加 FORCE INDEX 后计划变为
+// `type=range, key=ix_gotask_lease`，只锁选中的那几行（实测 7 条 vs 13 条），
+// 并发回收恢复正常。回归用例见 TestReapLockingReadStaysOnLeaseIndex。
+//
+// lease_until 刻意用 DATE_FORMAT 取成字符串、而不是扫进 time.Time：这个值要原样
+// 带回去做下面 UPDATE 的等值守卫，走字符串能完全避开 go-sql-driver 按 DSN 里的
+// loc 重新格式化时间的问题（与 client.go 里 dbTimeLayout 是同一条理由）。
+// 格式与 DATETIME(6) 的字面量一致。
+const reapExpiredIDsSQL = `SELECT id, attempt, max_attempts,
+    DATE_FORMAT(lease_until, '%Y-%m-%d %H:%i:%s.%f')
+FROM ` + tasksTable + ` FORCE INDEX (ix_gotask_lease)
+    WHERE status = 'running'
+      AND lease_until <= UTC_TIMESTAMP(6)
+    ORDER BY lease_until, id
+    LIMIT ?
+    FOR UPDATE SKIP LOCKED`
+
+// 回收的两条写回语句。
+//
+// 守卫不是 owner/epoch：回收器**不是租约持有者**，它没有凭据可比。它能证明的只有
+// "这条过期租约还是我刚才读到的那一条"，所以把读到的 lease_until 原值带进 WHERE。
+// 期间有人续租（lease_until 变成未来）或任务已被处理（status 变了），影响行数就是
+// 0，此时放手即可。
+//
+// 两条都**不动 attempt**：一次尝试从成功领取开始，这条任务已经用掉了那次机会，
+// 回收只是给下一次让路（技术设计 §4）。
+const (
+	reapToPendingSQL = `UPDATE ` + tasksTable + `
+    SET status = 'pending',
+        run_at = UTC_TIMESTAMP(6),
+        lease_owner = NULL, lease_until = NULL,
+        last_error = ?, updated_at = UTC_TIMESTAMP(6)
+    WHERE id = ? AND status = 'running' AND lease_until = ?`
+
+	reapToDeadSQL = `UPDATE ` + tasksTable + `
+    SET status = 'dead', finished_at = UTC_TIMESTAMP(6),
+        lease_owner = NULL, lease_until = NULL,
+        last_error = ?, updated_at = UTC_TIMESTAMP(6)
+    WHERE id = ? AND status = 'running' AND lease_until = ?`
+)
+
 // Claim 原子领取一批到期任务，实现 gorangetask.WorkerStore。
 //
 // 顺序是刻意的，分两段：
@@ -336,6 +402,108 @@ func (c *Client) RenewLease(ctx context.Context, task gorangetask.ClaimedTask, l
 		return fmt.Errorf("gorangetask/store/mysql: renew lease of task %d: %w", task.ID, err)
 	}
 	return checkLeaseAck(res, task)
+}
+
+// ReapExpiredLeases 回收一批租约已过期的任务，实现 gorangetask.WorkerStore。
+//
+// 它是"持有者已经消失"这条路径的唯一出口：进程崩溃、停机超时、Handler 不理会
+// 取消，都会留下一条永远不会自己结束的 running 任务，而租约是其中唯一会自然
+// 过期的凭据。
+//
+// 分流按 attempt 与 max_attempts 比较（技术设计 §4、§5.6）：
+//   - 次数未耗尽 → pending，run_at 设为数据库当前时间、清空租约；
+//   - 次数已耗尽 → dead，写 finished_at、清空租约。
+//
+// 整个动作在一个短事务里完成，**不执行任何 Handler**。并发安全来自两处：加锁读的
+// SKIP LOCKED 让多个回收器不抢同一行；每条更新再带 status='running' 与读到的
+// lease_until 原值做守卫。守卫不成立（影响 0 行）说明这行已被续租或已被处理，
+// 跳过它继续即可，**不返回 ErrLeaseLost** —— 那是租约持有者的错误语义，借用它
+// 会让"集群里有别的回收器在干活"看起来像故障。
+//
+// 返回的两个计数只统计**真正写回成功**的行数，被守卫挡掉的行不计入，因此 limit
+// 是"最多尝试处理"的上界，不是"至少处理"的下界。
+func (c *Client) ReapExpiredLeases(ctx context.Context, limit int) (gorangetask.ReapResult, error) {
+	var result gorangetask.ReapResult
+	if limit < 1 {
+		return result, fmt.Errorf("%w: reap limit must be > 0, got %d", gorangetask.ErrInvalidConfig, limit)
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("gorangetask/store/mysql: begin reap transaction: %w", err)
+	}
+	// 提交成功后 Rollback 返回 sql.ErrTxDone，是可忽略的常规行为。
+	defer func() { _ = tx.Rollback() }()
+
+	expiries, err := selectExpiredLeases(ctx, tx, limit)
+	if err != nil {
+		return result, err
+	}
+
+	for _, e := range expiries {
+		exhausted := e.attempt >= e.maxAttempts
+		stmt, marker := reapToPendingSQL, reapPendingError
+		if exhausted {
+			stmt, marker = reapToDeadSQL, reapDeadError
+		}
+
+		res, err := tx.ExecContext(ctx, stmt, marker, e.id, e.leaseUntil)
+		if err != nil {
+			return result, fmt.Errorf("gorangetask/store/mysql: reap task %d: %w", e.id, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return result, fmt.Errorf("gorangetask/store/mysql: reap task %d: %w", e.id, err)
+		}
+		if affected == 0 {
+			continue
+		}
+		if exhausted {
+			result.ToDead++
+		} else {
+			result.ToPending++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return result, fmt.Errorf("gorangetask/store/mysql: commit reap transaction: %w", err)
+	}
+	return result, nil
+}
+
+// expiredLease 是一条待回收的行，连同分流判断与写回守卫所需的全部信息。
+type expiredLease struct {
+	id          int64
+	attempt     int
+	maxAttempts int
+	// leaseUntil 是 DATE_FORMAT 出来的 DATETIME(6) 字面量，原样带回去做等值守卫。
+	leaseUntil string
+}
+
+// selectExpiredLeases 执行加锁读并收集结果。返回前必须把 rows 关掉：同一条事务
+// 连接上未读完的结果集会挡住后面的 UPDATE。
+func selectExpiredLeases(ctx context.Context, tx *sql.Tx, limit int) ([]expiredLease, error) {
+	rows, err := tx.QueryContext(ctx, reapExpiredIDsSQL, limit)
+	if err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: select expired leases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var expiries []expiredLease
+	for rows.Next() {
+		var e expiredLease
+		if err := rows.Scan(&e.id, &e.attempt, &e.maxAttempts, &e.leaseUntil); err != nil {
+			return nil, fmt.Errorf("gorangetask/store/mysql: scan expired lease: %w", err)
+		}
+		expiries = append(expiries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: read expired leases: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("gorangetask/store/mysql: close expired lease rows: %w", err)
+	}
+	return expiries, nil
 }
 
 // checkLeaseAck 把"影响 0 行"翻译成 ErrLeaseLost。

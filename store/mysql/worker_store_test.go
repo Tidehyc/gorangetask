@@ -41,3 +41,23 @@ func TestRenewLeaseRejectsInvalidInput(t *testing.T) {
 		})
 	}
 }
+
+// ReapExpiredLeases 的入参校验同样不连库。
+//
+// 非正的 limit 必须被挡住：它会变成 SQL 里的 `LIMIT 0` 或负数，前者让回收器永远
+// 什么也不做（而它恰恰是崩溃遗留任务的唯一出口），后者直接是语法错误。这两种都
+// 属于配置写错，应该在本地就报出来，而不是变成一个安静失效的保障。
+func TestReapExpiredLeasesRejectsInvalidLimit(t *testing.T) {
+	c := newTestClient(t, gorangetask.ClientConfig{})
+	ctx := context.Background()
+
+	for _, limit := range []int{0, -1} {
+		result, err := c.ReapExpiredLeases(ctx, limit)
+		if !errors.Is(err, gorangetask.ErrInvalidConfig) {
+			t.Fatalf("ReapExpiredLeases(limit=%d) error = %v, want ErrInvalidConfig", limit, err)
+		}
+		if result != (gorangetask.ReapResult{}) {
+			t.Errorf("ReapExpiredLeases(limit=%d) result = %+v, want zero value", limit, result)
+		}
+	}
+}
