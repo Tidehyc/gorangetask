@@ -18,12 +18,16 @@ jobs:
     # 参数与本地 scripts/dev-mysql.sh 对齐（utf8mb4 / utf8mb4_0900_ai_ci）。
     # MySQL 8.0 的默认字符集已经是 utf8mb4，迁移脚本里也显式声明了，
     # 所以这里不需要额外传 --character-set-server。
+    #
+    # 库名与本地保持同一个 `gotask`：不再区分「开发库」与「测试库」。
+    # migrations/mysql 直接用这个库（它自己不建库，只会对表做 DDL），
+    # store/mysql 用自动派生的 <库名>_store，两者不会互相删表。
     services:
       mysql:
         image: mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: rootpw
-          MYSQL_DATABASE: gotask_test
+          MYSQL_DATABASE: gotask
         ports:
           - 3306:3306
         options: >-
@@ -36,10 +40,11 @@ jobs:
       # 集成测试的开关。未设置时集成测试会 t.Skip，所以这个变量一旦漏配，
       # 测试会"全绿但什么都没验证"——下面的 Test 步骤专门挡这种情况。
       #
-      # 库名 gotask_test 由 service 预设；store 包的集成测试会自行创建派生库
-      # gotask_test_store，root 用户有权限。parseTime=true 供断言把 DATETIME
-      # 扫成 time.Time，loc=UTC 与库里的 UTC 时间对齐。
-      GOTASK_TEST_MYSQL_DSN: root:rootpw@tcp(127.0.0.1:3306)/gotask_test?parseTime=true&loc=UTC
+      # 库名 gotask 由 service 预设（本地则由 scripts/dev-mysql.sh up 创建）；
+      # store 包的集成测试会自行创建派生库 gotask_store，root 用户有权限。
+      # parseTime=true 供断言把 DATETIME 扫成 time.Time，loc=UTC 与库里的
+      # UTC 时间对齐。
+      GOTASK_TEST_MYSQL_DSN: root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC
 
     steps:
       - name: Checkout code

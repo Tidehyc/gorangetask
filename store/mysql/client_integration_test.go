@@ -19,7 +19,7 @@ import (
 
 // 集成测试需要一个可丢弃的 MySQL 数据库：
 //
-//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask_test?parseTime=true&loc=UTC'
+//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC'
 //
 // 未设置时全部跳过，因此普通的 go test ./... 不受影响。
 //
@@ -27,10 +27,10 @@ import (
 // 目的是让"入队写进去的到底长什么样"这件事有据可查。
 //
 // 数据库隔离：本包不直接使用 DSN 里的库，而是用 <库名>_store 这个派生库
-// （例如 gotask_test_store），并在需要时自动创建。原因是集成测试的 setup 是
-// 破坏性的（DROP TABLE + 重新迁移），而 go test ./... 会并发编译和运行不同的包：
-// 若本包与 migrations/mysql 共用同一个库，两边会互相删表，报出"dirty state"或
-// "Table already exists"这类与产品无关的假失败。
+// （DSN 写 gotask 时即 gotask_store），并在需要时自动创建。原因是集成测试的
+// setup 是破坏性的（DROP TABLE + 重新迁移），而 go test ./... 会并发编译和运行
+// 不同的包：若本包与 migrations/mysql 共用同一个库，两边会互相删表，报出
+// "dirty state"或"Table already exists"这类与产品无关的假失败。
 const (
 	testDSNEnv = "GOTASK_TEST_MYSQL_DSN"
 
@@ -55,7 +55,7 @@ func newTestClientAndDB(t *testing.T, cfg gorangetask.ClientConfig) (*Client, *s
 		t.Fatalf("parse %s: %v", testDSNEnv, err)
 	}
 	if parsed.DBName == "" {
-		t.Fatalf("%s must include a database name, e.g. .../gotask_test", testDSNEnv)
+		t.Fatalf("%s must include a database name, e.g. .../gotask", testDSNEnv)
 	}
 	// 断言里会把 DATETIME 扫成 time.Time，因此强制开启 parseTime，
 	// 不要求调用方在 DSN 里记得写。

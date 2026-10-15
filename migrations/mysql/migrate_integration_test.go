@@ -13,10 +13,21 @@ import (
 
 // 集成测试需要一个可丢弃的 MySQL 数据库：
 //
-//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask_test?parseTime=true&loc=UTC'
+//	export GOTASK_TEST_MYSQL_DSN='root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC'
 //
 // 未设置时全部跳过，因此普通的 go test ./... 不受影响。
 // 测试会删除该库中的 gotask_tasks 与 gotask_schema_migrations 表。
+//
+// 本包**直接使用 DSN 里的库、不做派生**，并**不会创建该库**：迁移是"建表"
+// 这件事的完整闭环，建库属于部署方的事。所以该库必须真实存在（本地由
+// scripts/dev-mysql.sh up 创建，CI 由 service container 的 MYSQL_DATABASE 预设）。
+// 库不存在时 sql.Open 不报错（惰性），要到下面的 PingContext 才以
+// `Error 1049 Unknown database` 失败——报错文案看着像"迁移失败"，
+// 实际是一条迁移语句都没跑。
+//
+// 并发安全：go test ./... 会并发运行不同的包，而本包 setup 是破坏性的
+// （DROP TABLE + 重新 Migrate）。store/mysql 用派生库 <库名>_store 避开，
+// 与本包不共用同一个库。
 
 const testDSNEnv = "GOTASK_TEST_MYSQL_DSN"
 
