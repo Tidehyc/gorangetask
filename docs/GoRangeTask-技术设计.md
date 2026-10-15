@@ -199,7 +199,14 @@ RowsAffected 必须为 1。为 0 时记 `lease_lost_writeback_total`，不尝试
 
 ### 5.5 失败确认与重试
 
-对可重试错误，重试延迟按 full jitter 指数退避计算：`delay = random(0, min(max_delay, base_delay × 2^(attempt-1)))`。默认 base 1 秒、最大 1 小时。延迟由 Worker 计算成 duration，SQL 用数据库时钟设置 `run_at`。
+对可重试错误，重试延迟按 **equal jitter** 指数退避计算：先取上界 `cap = min(max_delay, base_delay × 2^(attempt-1))`，再取 `delay = cap/2 + random(0, cap/2)`。默认 base 1 秒、最大 1 小时。延迟由 Worker 计算成 duration，SQL 用数据库时钟设置 `run_at`。
+
+> **抖动口径偏离说明（2026-10-15）**：本节最初写的是 full jitter `delay = random(0, cap)`，实现时改成了 equal jitter。两条理由：
+>
+> 1. **下限有意义**。full jitter 允许延迟取到 0，即"立刻可重试"——对已经故障的下游没有任何好处，只是更快吃掉剩余尝试次数；`cap/2` 的下限保证每次重试至少等到与当前退避级别相称的一段时间。
+> 2. **下限可断言**。有下界时 `run_at` 的增量能用区间断言卡住；`[0, cap]` 只能断言上界，"退避根本没生效"（延迟恒为 0）这类实现错误检查不出来。
+>
+> 需求文档 §4 的措辞是"有上限的指数退避并加入随机抖动"，两者都满足，因此按实现口径更正本文档。上界按 2 的幂增长并封顶这一点与原文一致；`cap` 的计算抽成纯函数 `retryBackoffCap` 单独测，避免"溢出成负数等价于没有退避"这类错误藏在抖动之后。
 
 可重试且 `attempt < max_attempts`：
 
