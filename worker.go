@@ -559,24 +559,81 @@ func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
 	return handler(runCtx, task.Payload)
 }
 
-// fail 把一次执行失败写回存储。本项的策略刻意最简：
-// 还有次数就立即回到 pending，次数耗尽就进 dead。
+// fail 把一次执行失败写回存储。
+//
+// 只有两种去向：不再重试（dead），或回到 pending 等下一次。
+// "不再重试"有两个彼此独立的理由，合在一个判断里——
+// 带永久标记（重试不会让它变好），或尝试次数已耗尽。
+//
+// 注意这里**不为两个理由写不同的 last_error**：摘要就是 cause.Error()，
+// 永久失败的可辨识性来自 Permanent 包装器自带的前缀（"permanent failure: "），
+// 而不是来自走的是哪个分支。所以"先判永久再判耗尽"与反过来在结果上完全等价，
+// 不必（也不该）为顺序写断言。
+//
+// 找不到 Handler（Registry.Resolve 返回永久 ErrNoHandler）与 payload 解码失败
+// （TypedHandler 返回永久 ErrInvalidPayload）都落在第一条上，因此它们不会白白
+// 重试到次数耗尽（需求文档 §4.2）。
 func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error) {
 	summary := cause.Error()
 
 	// Attempt 是"包含本次"的尝试次数，因此 Attempt >= MaxAttempts 即已耗尽。
-	if task.Attempt >= task.MaxAttempts {
-		if err := w.store.MarkDead(ctx, task, summary); err != nil {
-			w.report(fmt.Errorf("mark task %d dead: %w", task.ID, err))
-		}
+	if IsPermanent(cause) || task.Attempt >= task.MaxAttempts {
+		w.markDead(ctx, task, summary)
 		return
 	}
 
-	// delay 传 0：立即重试。指数退避与永久错误分类由 §4 补齐
-	// （技术设计 §5.5 已给出 full-jitter 公式）。
-	if err := w.store.Retry(ctx, task, 0, summary); err != nil {
+	if err := w.store.Retry(ctx, task, w.retryDelay(task.Attempt), summary); err != nil {
 		w.report(fmt.Errorf("retry task %d: %w", task.ID, err))
 	}
+}
+
+// markDead 把任务写回死信终态。写回失败通常是租约丢失，只上报。
+func (w *Worker) markDead(ctx context.Context, task ClaimedTask, summary string) {
+	if err := w.store.MarkDead(ctx, task, summary); err != nil {
+		w.report(fmt.Errorf("mark task %d dead: %w", task.ID, err))
+	}
+}
+
+// retryBackoffCap 返回第 attempt 次尝试失败后、下一次重试延迟的上界：
+// base × 2^(attempt-1)，以 max 封顶。
+//
+// 抽成纯函数是为了让"退避确实按指数增长、并且确实封顶"可以被**确定性**断言，
+// 而不必去观察随机化之后的延迟——后者只能给出区间。
+func retryBackoffCap(attempt int, base, max time.Duration) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	cap := base
+	for i := 1; i < attempt; i++ {
+		// 先判断再翻倍：MaxAttempts 是可配置的，attempt 可能很大，
+		// 一路左移会溢出成负数（那会变成"没有退避"）。
+		if cap > max/2 {
+			return max
+		}
+		cap *= 2
+	}
+	if cap > max {
+		return max
+	}
+	return cap
+}
+
+// retryDelay 计算一次重试的延迟。
+//
+// 分布取 [cap/2, cap]（equal jitter），**不是**技术设计 §5.5 最初写的
+// full jitter [0, cap]——偏离是刻意的，理由有两条：
+//
+//  1. 这个延迟最终会落成 run_at，等于 0 就是"立刻可重试"。对已经故障的下游
+//     没有任何好处，只是更快吃掉剩余尝试次数；cap/2 的下限保证每次重试都至少
+//     等到与当前退避级别相称的一段时间。
+//  2. 有下限才**可断言**：run_at 的增量能被区间断言卡住，而 [0, cap] 只能断言
+//     上界，"退避根本没生效"这类实现错误检查不出来。
+//
+// 仍然满足需求文档 §4.5 的"有上限的指数退避 + 随机抖动"：上界按 2 的幂增长并封顶，
+// 抖动把并发重试摊开在半个窗口上。全库只保留这一处抖动口径——空队列轮询用的
+// 也是 jitter()，理由相同（轮询的延迟为 0 就是忙等）。
+func (w *Worker) retryDelay(attempt int) time.Duration {
+	return jitter(retryBackoffCap(attempt, w.cfg.RetryBaseDelay, w.cfg.RetryMaxDelay))
 }
 
 // pickQueue 在监听队列之间轮转。只有一个队列时直接返回它。

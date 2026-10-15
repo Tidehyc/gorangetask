@@ -2383,6 +2383,176 @@ func TestWorkerReapsTaskAbandonedByShutdown(t *testing.T) {
 	}
 }
 
+// --- 失败分流与重试退避（§4 第 4 项） ---------------------------------------
+
+// workerStopTimeout 是 startWorker 等待 Worker 停机返回的上限。
+//
+// 必须明显小于停机预算（`Config.ShutdownTimeout`，默认 30s），这样"Run 没能按时
+// 停下"会以一条可归因的断言失败暴露出来，而不是把整个包拖进 `go test` 的 10 分钟
+// 包超时（那时只能拿到一份 goroutine dump，排查成本高得多）。
+const workerStopTimeout = 15 * time.Second
+
+// startWorker 起一个 Worker，返回一个**幂等**的停机函数；用例结束时会自动调用它。
+//
+// 这里踩过两个坑，都写下来免得重犯：
+//
+//   - **不用 `sync.Once` 做幂等。** Once 在闭包执行期间持有自己的互斥量，闭包里的
+//     任何一次重入都会自锁，而且锁的是同一个地址，dump 里只能看到 `Mutex.Lock`。
+//     改用显式标记，重入直接返回。
+//   - **取消函数不叫 `cancel`。** 这个函数原先的具名返回值就叫 `cancel`，而
+//     `ctx, cancel := context.WithCancel(...)` 与具名返回值在同一个块里，属于
+//     "短变量声明重声明"，两者是**同一个变量**；末尾 `return stop` 会把它改写成
+//     `stop`。而闭包捕获的是**变量**不是值，于是闭包里的 `cancel()` 实际调用的是
+//     `stop` —— 一次 `once.Do` 重入自锁，且 **ctx 从头到尾没被取消**（`Run` 会一直
+//     停在 `<-ctx.Done()` 上）。表现是：用例失败后清理阶段永久挂死。
+func startWorker(t *testing.T, w *gorangetask.Worker) (stop func()) {
+	t.Helper()
+
+	ctx, cancelRun := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	// stop 只由测试 goroutine 调用（用例自身 + t.Cleanup），因此普通布尔量足够。
+	var stopped bool
+	stop = func() {
+		if stopped {
+			return
+		}
+		stopped = true
+
+		cancelRun()
+		select {
+		case <-done:
+		case <-time.After(workerStopTimeout):
+			t.Errorf("worker did not stop within %s", workerStopTimeout)
+		}
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+// waitForFailWritten 等到任务被写回过一次失败（last_error 非 NULL 且仍在 pending）。
+//
+// 不能直接 waitForStatus(..., "pending")：任务**入队时就是 pending**，那样会在
+// Worker 领取之前就返回，读到的是入队时的 run_at，实测差值是 0——用例会因为
+// 完全错误的原因失败。所以必须等"这次失败已经被写回去"这个更具体的信号。
+func waitForFailWritten(t *testing.T, db *sql.DB, id gorangetask.TaskID, timeout time.Duration) taskRow {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		row := readTask(t, db, id)
+		if row.status == "pending" && row.lastError.Valid {
+			return row
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %d never came back as a retried pending (status=%q, last_error=%v)",
+				id, row.status, row.lastError)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWorkerPermanentFailureEndsDeadInOneAttempt 是永久错误的端到端验收。
+//
+// 最关键的断言是 **attempt == 1**——库侧的尝试次数是"到底重试过没有"的独立证据：
+// 进程侧有没有调用 Retry 在这条用例里看不出来，但一次真正的重试必须重新领取，
+// 而每次领取都会把 attempt +1。只看终态是 dead 是不够的，"先重试几次再 dead"
+// 与"第一次就 dead"在终态上一模一样。
+func TestWorkerPermanentFailureEndsDeadInOneAttempt(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	const queue = "q-permanent-e2e"
+
+	id := enqueueForReap(t, c, queue, 5)
+
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "email.send", func(context.Context, json.RawMessage) error {
+		return gorangetask.Permanent(errors.New("recipient rejected by the mail gateway"))
+	})
+
+	w, err := gorangetask.NewWorker(c, reg, workerConfig(queue))
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	stop := startWorker(t, w)
+
+	row := waitForStatus(t, db, id, "dead", 10*time.Second)
+	stop()
+
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1: 永久失败只消耗一次尝试，重试过就会是 2", row.attempt)
+	}
+	if !strings.HasPrefix(row.lastError.String, "permanent failure:") {
+		t.Errorf("last_error = %q, want the permanent marker（与「次数耗尽」区分开）",
+			row.lastError.String)
+	}
+	if !strings.Contains(row.lastError.String, "recipient rejected") {
+		t.Errorf("last_error = %q, want the handler message kept", row.lastError.String)
+	}
+	if !row.finishedAt.Valid {
+		t.Error("finished_at is NULL on a dead task")
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease not cleared on dead: owner=%v until=%v", row.leaseOwner, row.leaseUntil)
+	}
+}
+
+// TestWorkerRetryBackoffLandsInRunAt 证明退避延迟确实走到了 SQL。
+//
+// 根包那层只能看到"传给 store 的 duration"，而延迟丢掉与否（比如 SQL 里忘了
+// TIMESTAMPADD）只有真库能证。断言用区间：下限排除"延迟为 0 / 退避没生效"，
+// 上限排除"没有封顶"。
+func TestWorkerRetryBackoffLandsInRunAt(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	const queue = "q-backoff-e2e"
+
+	id := enqueueForReap(t, c, queue, 5)
+
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "email.send", func(context.Context, json.RawMessage) error {
+		return errors.New("downstream is down")
+	})
+
+	cfg := workerConfig(queue)
+	cfg.RetryBaseDelay = 2 * time.Second
+	cfg.RetryMaxDelay = time.Hour
+
+	w, err := gorangetask.NewWorker(c, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	// t0 取在 Worker 启动之前，因此 run_at - t0 就是实际落库的延迟（外加一点
+	// 领取与执行的开销）。
+	t0 := dbNow(t, db)
+	stop := startWorker(t, w)
+
+	row := waitForFailWritten(t, db, id, 10*time.Second)
+	stop()
+
+	// attempt 1 ⇒ 上界 base×2^0 = base。
+	cap := cfg.RetryBaseDelay
+	got := row.runAt.UTC().Sub(t0)
+	const slack = 300 * time.Millisecond
+	if got < cap/2-slack || got > cap+slack {
+		t.Errorf("run_at - t0 = %s, want within [%s, %s] (cap = %s): "+
+			"下限排除没有退避，上限排除没有封顶", got, cap/2-slack, cap+slack, cap)
+	}
+	if row.attempt != 1 {
+		t.Errorf("attempt = %d, want 1（这是第一次重试）", row.attempt)
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease not cleared on retry: owner=%v until=%v", row.leaseOwner, row.leaseUntil)
+	}
+	if !strings.Contains(row.lastError.String, "downstream is down") {
+		t.Errorf("last_error = %q, want the failure kept", row.lastError.String)
+	}
+	// 重试的摘要不带永久前缀——它和永久失败必须在库里能区分开。
+	if strings.HasPrefix(row.lastError.String, "permanent failure:") {
+		t.Errorf("last_error = %q, want no permanent marker on a retryable failure", row.lastError.String)
+	}
+}
+
 // --- 小工具 ---------------------------------------------------------------
 
 func mustDecode(t *testing.T, raw json.RawMessage) any {

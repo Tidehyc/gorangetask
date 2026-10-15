@@ -411,7 +411,11 @@ func TestWorkerRetriesFailedHandler(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	w, err := NewWorker(store, reg, fastConfig())
+	cfg := fastConfig()
+	cfg.RetryBaseDelay = 40 * time.Millisecond
+	cfg.RetryMaxDelay = 640 * time.Millisecond
+
+	w, err := NewWorker(store, reg, cfg)
 	if err != nil {
 		t.Fatalf("NewWorker() unexpected error: %v", err)
 	}
@@ -426,8 +430,12 @@ func TestWorkerRetriesFailedHandler(t *testing.T) {
 	if retries[0].task.ID != 11 {
 		t.Errorf("retried task %d, want 11", retries[0].task.ID)
 	}
-	if retries[0].delay != 0 {
-		t.Errorf("retry delay = %s, want 0 (立即重试，退避留给 §4)", retries[0].delay)
+	// attempt 1 的上界就是 base。断言区间而不是具体值：延迟带抖动，但
+	// 两端由 retryDelay 的定义决定，因此这条断言是确定性的。
+	cap := retryBackoffCap(1, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+	if retries[0].delay < cap/2 || retries[0].delay > cap {
+		t.Errorf("retry delay = %s, want within [%s, %s] (cap = base×2^0)",
+			retries[0].delay, cap/2, cap)
 	}
 	if !strings.Contains(retries[0].lastError, "smtp unavailable") {
 		t.Errorf("lastError = %q, want the handler error text", retries[0].lastError)
@@ -470,10 +478,13 @@ func TestWorkerMarksDeadWhenAttemptsExhausted(t *testing.T) {
 	}
 }
 
-// TestWorkerUnknownTypeIsRetriedForNow 记录本项的既定边界：未知 task type 的
-// 错误虽然带永久标记，但"永久错误直接进 dead"属于 §4「重试退避与永久错误」，
-// 本项一律按可重试处理，因此它会重试到次数耗尽才进 dead。
-func TestWorkerUnknownTypeIsRetriedForNow(t *testing.T) {
+// TestWorkerUnknownTypeGoesStraightToDead 固化需求文档 §4.2 的一条硬要求：
+// "找不到 Handler 或无法解码 payload 的任务不能无限快速重试"。
+//
+// Registry.Resolve 返回的错误**带永久标记**（Lookup 刻意不带），因此这里不需要
+// Worker 单独识别任务类型——它只是尊重标记。用例同时断言 Retry **零调用**：
+// 只看 dead 终态是不够的，"先重试一次再 dead"和"直接 dead"在终态上无法区分。
+func TestWorkerUnknownTypeGoesStraightToDead(t *testing.T) {
 	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(17, "missing", 1, 5)}}}
 	w, err := NewWorker(store, newRegistryWith(t, "t"), fastConfig())
 	if err != nil {
@@ -483,12 +494,223 @@ func TestWorkerUnknownTypeIsRetriedForNow(t *testing.T) {
 		t.Fatalf("runOnce() error: %v", err)
 	}
 
-	retries := store.retryCalls()
-	if len(retries) != 1 {
-		t.Fatalf("retry called %d times, want 1", len(retries))
+	if retries := store.retryCalls(); len(retries) != 0 {
+		t.Fatalf("Retry called %d times, want 0: 未知 task type 是永久失败，不该消耗剩余尝试次数", len(retries))
 	}
-	if !strings.Contains(retries[0].lastError, "no handler") {
-		t.Errorf("lastError = %q, want it to mention the missing handler", retries[0].lastError)
+	dead := store.deadCalls()
+	if len(dead) != 1 {
+		t.Fatalf("MarkDead called %d times, want 1", len(dead))
+	}
+	if !strings.Contains(dead[0].lastError, "no handler") {
+		t.Errorf("lastError = %q, want it to mention the missing handler", dead[0].lastError)
+	}
+	// 永久失败的摘要带前缀，运维在库里能分辨"不可能成功"与"次数用完了"。
+	if !strings.HasPrefix(dead[0].lastError, "permanent failure:") {
+		t.Errorf("lastError = %q, want it to start with the permanent marker", dead[0].lastError)
+	}
+}
+
+// TestWorkerInvalidPayloadGoesStraightToDead 覆盖另一条永久失败来源：
+// TypedHandler 的 payload 解码失败（返回永久 ErrInvalidPayload）。
+//
+// 它和第 1 次尝试就 dead 是同一件事，但走的是完全不同的代码路径
+// （handler.go 而不是 registry），所以分开断言。
+func TestWorkerInvalidPayloadGoesStraightToDead(t *testing.T) {
+	task := claimedTask(21, "typed", 1, 5)
+	// TypedHandler 期望一个对象，这里给一个解不开的 payload。
+	task.Payload = json.RawMessage(`"not an object"`)
+	store := &fakeStore{batches: [][]ClaimedTask{{task}}}
+	reg := NewRegistry()
+	var ran int
+	if err := reg.Register("typed", TypedHandler(func(context.Context, struct{ N int }) error {
+		ran++
+		return nil
+	})); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	if ran != 0 {
+		t.Errorf("typed handler body ran %d times, want 0: 解码失败时不该进入函数体", ran)
+	}
+	if retries := store.retryCalls(); len(retries) != 0 {
+		t.Fatalf("Retry called %d times, want 0: payload 解码失败是永久失败", len(retries))
+	}
+	dead := store.deadCalls()
+	if len(dead) != 1 {
+		t.Fatalf("MarkDead called %d times, want 1", len(dead))
+	}
+	if !strings.Contains(dead[0].lastError, "invalid payload") {
+		t.Errorf("lastError = %q, want it to mention the invalid payload", dead[0].lastError)
+	}
+}
+
+// TestWorkerFailureOutcomeMatrix 把 fail 的**判定规则**一次钉完：去向只由两件事
+// 决定——错误有没有永久标记，以及尝试次数还剩不剩；摘要文本只由错误自己决定。
+//
+// 之所以做成一张表：这四条本来就该互相印证。写这条用例时先按"先判永久、后判耗尽，
+// 顺序会影响摘要"的假设写过一版，**证伪检查当场否掉了它**——把永久分支短路后那条
+// 用例照样通过，因为 "permanent failure: " 前缀来自 Permanent 包装器的 Error()，
+// 与走哪条分支无关。顺序在结果上不可观察，所以这里只断言可观察的东西。
+func TestWorkerFailureOutcomeMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		permanent   bool
+		attempt     int
+		maxAttempts int
+		wantRetry   bool
+		wantDead    bool
+		wantPrefix  bool
+	}{
+		{"可重试且还有次数 → 重试", false, 1, 3, true, false, false},
+		{"可重试但次数耗尽 → dead", false, 3, 3, false, true, false},
+		{"永久失败且还有次数 → dead", true, 1, 9, false, true, true},
+		{"永久失败且正好最后一次 → dead", true, 3, 3, false, true, true},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := TaskID(30 + i)
+			store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(id, "t", tc.attempt, tc.maxAttempts)}}}
+
+			reg := NewRegistry()
+			if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+				err := errors.New("boom")
+				if tc.permanent {
+					return Permanent(err)
+				}
+				return err
+			}); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+
+			cfg := fastConfig()
+			cfg.RetryBaseDelay = 40 * time.Millisecond
+			cfg.RetryMaxDelay = 640 * time.Millisecond
+
+			w, err := NewWorker(store, reg, cfg)
+			if err != nil {
+				t.Fatalf("NewWorker() unexpected error: %v", err)
+			}
+			if _, err := w.runOnce(context.Background()); err != nil {
+				t.Fatalf("runOnce() error: %v", err)
+			}
+
+			retries, dead := store.retryCalls(), store.deadCalls()
+			if gotRetry := len(retries) == 1; gotRetry != tc.wantRetry {
+				t.Errorf("Retry called = %v (%d 次), want %v", gotRetry, len(retries), tc.wantRetry)
+			}
+			if gotDead := len(dead) == 1; gotDead != tc.wantDead {
+				t.Errorf("MarkDead called = %v (%d 次), want %v", gotDead, len(dead), tc.wantDead)
+			}
+			// 同一条失败不该既重试又进死信。
+			if len(retries) > 0 && len(dead) > 0 {
+				t.Error("同一次失败同时出现了 Retry 与 MarkDead")
+			}
+
+			summary := ""
+			switch {
+			case len(retries) == 1:
+				summary = retries[0].lastError
+				// 重试必须带退避：上界是 base×2^(attempt-1)。
+				cap := retryBackoffCap(tc.attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+				if retries[0].delay < cap/2 || retries[0].delay > cap {
+					t.Errorf("retry delay = %s, want within [%s, %s]",
+						retries[0].delay, cap/2, cap)
+				}
+			case len(dead) == 1:
+				summary = dead[0].lastError
+			default:
+				t.Fatal("既没有 Retry 也没有 MarkDead")
+			}
+
+			if !strings.Contains(summary, "boom") {
+				t.Errorf("lastError = %q, want the original error text", summary)
+			}
+			if gotPrefix := strings.HasPrefix(summary, "permanent failure:"); gotPrefix != tc.wantPrefix {
+				t.Errorf("lastError = %q, permanent 前缀 = %v, want %v", summary, gotPrefix, tc.wantPrefix)
+			}
+		})
+	}
+}
+
+// TestWorkerRetrybackoffCapIsExponentialAndCapped 固定退避上界的**纯函数**。
+//
+// 之所以把它抽出来单独测：延迟本身带抖动，只能断言区间；而"按 2 的幂增长"和
+// "封顶"这两件事一旦写错（例如溢出成负数，等价于没有退避）在区间断言里看不出来。
+func TestWorkerRetrybackoffCapIsExponentialAndCapped(t *testing.T) {
+	const (
+		base = 100 * time.Millisecond
+		max  = 1600 * time.Millisecond
+	)
+
+	tests := []struct {
+		name    string
+		attempt int
+		base    time.Duration
+		max     time.Duration
+		want    time.Duration
+	}{
+		{"attempt 0 按第 1 次算", 0, base, max, base},
+		{"attempt 负数按第 1 次算", -3, base, max, base},
+		{"第 1 次 = base", 1, base, max, base},
+		{"第 2 次翻倍", 2, base, max, 2 * base},
+		{"第 3 次再翻倍", 3, base, max, 4 * base},
+		{"第 4 次到上界", 4, base, max, 8 * base},
+		{"第 5 次封顶", 5, base, max, max},
+		{"远超上界也不溢出", 1 << 20, base, max, max},
+		{"base 已超过 max 时直接封顶", 1, 4 * time.Second, max, max},
+		{"max 为 0 时不做无意义放大", 3, base, 0, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryBackoffCap(tc.attempt, tc.base, tc.max); got != tc.want {
+				t.Errorf("retryBackoffCap(%d, %s, %s) = %s, want %s",
+					tc.attempt, tc.base, tc.max, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWorkerRetryDelayStaysWithinItsBackoffCap 断言抖动后的延迟落在
+// [cap/2, cap] 里，且这个区间随 attempt 逐级抬高、最终被 RetryMaxDelay 卡住。
+//
+// 区间两端都由定义决定，因此多次抽样不会 flaky；而"每次抽样都在区间内"同时
+// 排除了两类错误实现：没有退避（整个区间会贴着 0）与没有上限（上端会越过 max）。
+func TestWorkerRetryDelayStaysWithinItsBackoffCap(t *testing.T) {
+	const (
+		base = 20 * time.Millisecond
+		max  = 160 * time.Millisecond
+	)
+	w := &Worker{cfg: Config{RetryBaseDelay: base, RetryMaxDelay: max}}
+
+	for _, attempt := range []int{1, 2, 3, 4, 5, 6} {
+		cap := retryBackoffCap(attempt, base, max)
+		for i := 0; i < 100; i++ {
+			got := w.retryDelay(attempt)
+			if got < cap/2 || got > cap {
+				t.Fatalf("retryDelay(%d) = %s, want within [%s, %s]", attempt, got, cap/2, cap)
+			}
+		}
+	}
+
+	// 区间确实在往上走，而不是常数。
+	if retryBackoffCap(1, base, max) >= retryBackoffCap(2, base, max) {
+		t.Error("退避上界没有随尝试次数增长")
+	}
+	// 并且确实被封住。
+	if got := retryBackoffCap(50, base, max); got != max {
+		t.Errorf("retryBackoffCap(50) = %s, want capped at %s", got, max)
+	}
+	if got := w.retryDelay(1 << 20); got > max {
+		t.Errorf("retryDelay(超出上界的次数) = %s, want <= %s", got, max)
 	}
 }
 
