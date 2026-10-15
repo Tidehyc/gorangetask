@@ -1,12 +1,14 @@
 package gorangetask
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -556,7 +558,56 @@ func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return handler(runCtx, task.Payload)
+	return runHandler(handler, runCtx, task.Payload)
+}
+
+// panicStackLines 是 panic 堆栈写入 last_error 时的最大行数。
+//
+// 堆栈是判断"panic 出自 Handler 本身还是它调用的库"最有用的东西，但 `debug.Stack()`
+// 动辄几十行，而 last_error 列只有 2048 字符、且定位是给人读的摘要——超出部分
+// 反正会被 truncateRunes 截掉，不如自己先截，还能保住摘要开头那句关键信息。
+const panicStackLines = 12
+
+// runHandler 在**单任务边界**运行一次 Handler，把 panic 转成普通错误。
+//
+// 需求文档 §4.2：Handler panic 由 Worker 捕获并视为一次失败，不得使整个 Worker
+// 进程意外退出。这里给出的错误**刻意不打永久标记**——需求说的只是"视为一次失败"，
+// 而 panic 未必是确定性的（可能依赖外部状态或时序），直接判死会丢掉恢复的机会；
+// 上限由 max_attempts 兜底，重试耗尽同样进 dead。
+//
+// 边界刻意收得很窄，**只包住 Handler 调用本身**：本库自己的领取、写回、回收逻辑
+// 若 panic，属于本库的 bug，应当照常崩掉，不该被伪装成"某条任务失败"而藏起来
+// （技术设计 §5.5「进程级不可恢复错误不应被吞掉」）。
+//
+// 局限：只能捕获**同一个 goroutine** 里的 panic。Handler 若在自己的子协程里 panic
+// （`go func(){ ... }()`），本函数拦不到，Go 运行时会直接终止进程。这条写进文档，
+// 因为"Worker 兜底"容易被误读成"随便怎么 panic 都安全"。
+func runHandler(handler Handler, ctx context.Context, payload json.RawMessage) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		err = fmt.Errorf("handler panicked: %v\n%s", r, panicStack())
+	}()
+	return handler(ctx, payload)
+}
+
+// panicStack 返回截断后的 panic 堆栈（不含首行的 goroutine 头）。
+//
+// 首行形如 `goroutine 42 [running]:`，只说明"现在在跑"，对定位没有价值；
+// 真正有用的是紧随其后的 Handler 帧。
+func panicStack() string {
+	stack := debug.Stack()
+	if idx := bytes.IndexByte(stack, '\n'); idx >= 0 {
+		stack = stack[idx+1:]
+	}
+
+	lines := bytes.SplitN(stack, []byte("\n"), panicStackLines+1)
+	if len(lines) > panicStackLines {
+		lines = append(lines[:panicStackLines], []byte("..."))
+	}
+	return string(bytes.Join(lines, []byte("\n")))
 }
 
 // fail 把一次执行失败写回存储。

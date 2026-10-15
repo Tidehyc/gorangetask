@@ -2110,3 +2110,181 @@ func TestWorkerDoesNotReportReapFailuresCausedByShutdown(t *testing.T) {
 		}
 	}
 }
+
+// --- Handler panic 兜底（§4 第 5 项） ---------------------------------------
+
+// TestRunHandlerConvertsPanicToError 钉住 panic 边界本身：正常返回不动、
+// 普通错误原样穿透、panic 转成错误且带上 panic 值与堆栈。
+func TestRunHandlerConvertsPanicToError(t *testing.T) {
+	t.Run("正常返回不改写", func(t *testing.T) {
+		err := runHandler(func(context.Context, json.RawMessage) error { return nil },
+			context.Background(), nil)
+		if err != nil {
+			t.Errorf("runHandler() = %v, want nil", err)
+		}
+	})
+
+	t.Run("普通错误原样穿透", func(t *testing.T) {
+		sentinel := errors.New("plain failure")
+		err := runHandler(func(context.Context, json.RawMessage) error { return sentinel },
+			context.Background(), nil)
+		if !errors.Is(err, sentinel) {
+			t.Errorf("runHandler() = %v, want the handler error to pass through unchanged", err)
+		}
+		if strings.Contains(err.Error(), "panicked") {
+			t.Errorf("runHandler() = %v, want no panic wording on an ordinary error", err)
+		}
+	})
+
+	t.Run("panic 转成带值与堆栈的错误", func(t *testing.T) {
+		err := runHandler(func(context.Context, json.RawMessage) error {
+			panic("boom: nil map write")
+		}, context.Background(), nil)
+
+		if err == nil {
+			t.Fatal("runHandler() = nil, want an error: 否则 panic 会一路冒到 Run 把进程带走")
+		}
+		if !strings.Contains(err.Error(), "handler panicked") {
+			t.Errorf("error = %q, want it to say the handler panicked", err)
+		}
+		if !strings.Contains(err.Error(), "boom: nil map write") {
+			t.Errorf("error = %q, want the recovered value kept", err)
+		}
+		// 堆栈必须能指回发起 panic 的那一帧，否则这段堆栈等于没写。
+		if !strings.Contains(err.Error(), "worker_test.go") {
+			t.Errorf("error = %q, want the stack to point back at the panicking frame", err)
+		}
+		if IsPermanent(err) {
+			t.Error("panic 不该带永久标记：需求只说「视为一次失败」，去留交给 max_attempts")
+		}
+	})
+}
+
+// TestWorkerRetriesHandlerPanic 把 panic 兜底接到失败路径上：它必须与普通失败
+// 走**完全一样**的分流（还有次数就退避重试），既不单独处理，也不让 Worker 崩掉。
+//
+// "没崩掉"这件事无法直接断言——真让 panic 冒出去，测试进程会在 `runOnce` 那行
+// 之前就终止、连失败都打不出来。所以这条用例**跑完本身就是证据**，另外再用
+// Retry 的调用记录把"走的是重试"钉住。
+func TestWorkerRetriesHandlerPanic(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(41, "t", 1, 3)}}}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		panic("handler exploded")
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	cfg := fastConfig()
+	cfg.RetryBaseDelay = 40 * time.Millisecond
+	cfg.RetryMaxDelay = 640 * time.Millisecond
+
+	w, err := NewWorker(store, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	retries := store.retryCalls()
+	if len(retries) != 1 {
+		t.Fatalf("Retry called %d times, want 1: panic 应视为一次失败", len(retries))
+	}
+	if len(store.deadCalls()) != 0 {
+		t.Error("panic 不该直接进死信：还有剩余尝试次数")
+	}
+	if !strings.Contains(retries[0].lastError, "handler panicked") {
+		t.Errorf("lastError = %q, want the panic wording", retries[0].lastError)
+	}
+	if !strings.Contains(retries[0].lastError, "handler exploded") {
+		t.Errorf("lastError = %q, want the recovered value kept", retries[0].lastError)
+	}
+	// 走的是同一套退避，不是"panic 专属"的另一条路径。
+	cap := retryBackoffCap(1, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+	if retries[0].delay < cap/2 || retries[0].delay > cap {
+		t.Errorf("retry delay = %s, want within [%s, %s]", retries[0].delay, cap/2, cap)
+	}
+}
+
+// TestWorkerHandlerPanicGoesDeadWhenAttemptsExhausted 是 panic 的另一端：
+// 次数耗尽时和普通失败一样进死信，摘要仍保留 panic 值与堆栈。
+func TestWorkerHandlerPanicGoesDeadWhenAttemptsExhausted(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{claimedTask(42, "t", 3, 3)}}}
+
+	reg := NewRegistry()
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error {
+		panic("no luck on the last attempt")
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	if retries := store.retryCalls(); len(retries) != 0 {
+		t.Fatalf("Retry called %d times, want 0: 次数已耗尽", len(retries))
+	}
+	dead := store.deadCalls()
+	if len(dead) != 1 {
+		t.Fatalf("MarkDead called %d times, want 1", len(dead))
+	}
+	if !strings.Contains(dead[0].lastError, "handler panicked") {
+		t.Errorf("lastError = %q, want the panic wording", dead[0].lastError)
+	}
+	if !strings.Contains(dead[0].lastError, "no luck on the last attempt") {
+		t.Errorf("lastError = %q, want the recovered value kept", dead[0].lastError)
+	}
+	// panic 与"永久失败"是两码事：库里必须能分辨，否则运维会误判成不可重试的配置问题。
+	if strings.HasPrefix(dead[0].lastError, "permanent failure:") {
+		t.Errorf("lastError = %q, want no permanent marker on a panic", dead[0].lastError)
+	}
+}
+
+// TestWorkerKeepsProcessingBatchAfterHandlerPanic 守住"兜底是单任务边界"这句话：
+// panic 只终结发生它的那一条任务，批里后面的任务照常执行。
+func TestWorkerKeepsProcessingBatchAfterHandlerPanic(t *testing.T) {
+	store := &fakeStore{batches: [][]ClaimedTask{{
+		claimedTask(51, "boom", 1, 3),
+		claimedTask(52, "ok", 1, 3),
+	}}}
+
+	reg := NewRegistry()
+	if err := reg.Register("boom", func(context.Context, json.RawMessage) error {
+		panic("first task exploded")
+	}); err != nil {
+		t.Fatalf("Register(boom): %v", err)
+	}
+	var okRan int
+	if err := reg.Register("ok", func(context.Context, json.RawMessage) error {
+		okRan++
+		return nil
+	}); err != nil {
+		t.Fatalf("Register(ok): %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+	if _, err := w.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce() error: %v", err)
+	}
+
+	if okRan != 1 {
+		t.Errorf("second handler ran %d times, want 1: 一条任务 panic 不该中断整批", okRan)
+	}
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 52 {
+		t.Errorf("succeeded = %v, want [52]", got)
+	}
+	retries := store.retryCalls()
+	if len(retries) != 1 || retries[0].task.ID != 51 {
+		t.Errorf("retries = %v, want exactly task 51", retries)
+	}
+}

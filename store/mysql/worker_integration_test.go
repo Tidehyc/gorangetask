@@ -2553,6 +2553,60 @@ func TestWorkerRetryBackoffLandsInRunAt(t *testing.T) {
 	}
 }
 
+// --- Handler panic 兜底（§4 第 5 项） ---------------------------------------
+
+// TestWorkerRetriesAfterHandlerPanicAndThenSucceeds 是 panic 兜底的真库验收：
+// 第一次执行 panic，退避之后被重新领取并成功，终态是 succeeded。
+//
+// 最关键的两条断言是 **handler 被调用 2 次** 与 **attempt == 2**：它们一起证明
+// "panic 之后确实重新领取执行了一次"。只看终态是不够的——终态 succeeded 也可能
+// 来自"panic 被当成了成功"这种错误实现，而那正是这条用例要排除的。
+func TestWorkerRetriesAfterHandlerPanicAndThenSucceeds(t *testing.T) {
+	c, db := newTestClientAndDB(t, gorangetask.ClientConfig{})
+	const queue = "q-panic-e2e"
+
+	id := enqueueForReap(t, c, queue, 5)
+
+	var calls atomic.Int32
+	reg := gorangetask.NewRegistry()
+	mustRegister(t, reg, "email.send", func(context.Context, json.RawMessage) error {
+		if calls.Add(1) == 1 {
+			panic("transient panic: upstream returned a malformed reply")
+		}
+		return nil
+	})
+
+	cfg := workerConfig(queue)
+	cfg.RetryBaseDelay = 200 * time.Millisecond
+	cfg.RetryMaxDelay = time.Second
+
+	w, err := gorangetask.NewWorker(c, reg, cfg)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	stop := startWorker(t, w)
+
+	row := waitForStatus(t, db, id, "succeeded", 10*time.Second)
+	stop()
+
+	if got := calls.Load(); got != 2 {
+		t.Errorf("handler called %d times, want 2（第一次 panic，重试后成功）", got)
+	}
+	if row.attempt != 2 {
+		t.Errorf("attempt = %d, want 2：panic 用掉一次尝试，重试再消耗一次", row.attempt)
+	}
+	if !row.finishedAt.Valid {
+		t.Error("finished_at is NULL on a succeeded task")
+	}
+	if row.leaseOwner.Valid || row.leaseUntil.Valid {
+		t.Errorf("lease not cleared on success: owner=%v until=%v", row.leaseOwner, row.leaseUntil)
+	}
+	// 成功写回会清空 last_error，所以第一次 panic 写下的摘要不该留在终态上。
+	if row.lastError.Valid {
+		t.Errorf("last_error = %q, want NULL on a succeeded task", row.lastError.String)
+	}
+}
+
 // --- 小工具 ---------------------------------------------------------------
 
 func mustDecode(t *testing.T, raw json.RawMessage) any {
