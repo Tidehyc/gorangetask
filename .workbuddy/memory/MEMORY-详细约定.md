@@ -238,3 +238,58 @@
 - 证伪检查的备份放仓库外（`/home/tide/.cache/falsify/`），别在仓库里建临时目录。
 - 沙箱会把脚本里的变量名 `sc`/`reg` 当成系统命令拦截（误报）——写脚本时避开这两个名字，
   或把脚本写成文件再跑。
+
+## 失败分流、退避与 panic 兜底（2026-10-15 定，§4 第 4+5 项）
+
+- **`fail` 只有两种去向**：`IsPermanent(cause) || Attempt >= MaxAttempts` ⇒ `MarkDead`，
+  否则带退避 `Retry`。两个"不再重试"的理由**合在一个判断里**是刻意的：永久失败的可
+  辨识性来自 `Permanent` 包装器自带的 `"permanent failure: "` 前缀，不来自走哪个分支
+  ⇒ 分支顺序在结果上不可观察，**不该也不能为它写断言**（这一点是证伪检查逼出来的，
+  原先那条"最后一次尝试 + 永久失败 ⇒ 摘要带永久前缀"的用例是装饰，已换成只断言可观察
+  结果的表驱动矩阵）。
+- **退避上界抽成纯函数** `retryBackoffCap(attempt, base, max)`＝`base × 2^(attempt-1)`
+  封顶 `max`，**先判 `cap > max/2` 再翻倍**：`MaxAttempts` 可配置，attempt 很大时一路
+  左移会溢出成负数，那等价于"没有退避"而区间断言看不出来。`attempt < 1` 一律按第 1 次算。
+- **抖动口径 = equal jitter `[cap/2, cap]`，全库只此一处**（队列轮询用的也是
+  `jitter()`）。**刻意偏离技术设计 §5.5 原文的 full jitter**，理由两条：① full jitter
+  允许延迟取 0 ＝ 立刻重试，对故障下游没有好处、只是更快吃掉剩余尝试次数；
+  ② 有下限才**可断言**——`[0, cap]` 只能断言上界，"退避根本没生效"检查不出来。
+  需求文档 §4 只说"有上限的指数退避 + 随机抖动"，两者都满足。文档已按实现口径回填。
+- **panic 兜底 = 单任务边界 recover**（根包 `runHandler`）：**只包住 Handler 调用本身**，
+  本库自己的领取/写回/回收若 panic 照常崩（技术设计 §5.5「进程级不可恢复错误不应被
+  吞掉」）。转出的错误形如 `handler panicked: <值>\n<堆栈>`，**不打永久标记**——需求只
+  说"视为一次失败"，panic 未必确定性，去留交给 `max_attempts`。堆栈由 `panicStack()`
+  截断：丢首行 `goroutine N [running]:`、取 12 行、超出以 `...` 收尾（`last_error`
+  只有 2048 字符且是给人读的摘要）。**局限**：只能捕获同 goroutine 的 panic；Handler
+  在自己起的子协程里 panic 拦不住，Go 会终止进程。
+- 这两项让"带永久标记但仍重试到耗尽"这一 §3 遗留缺口闭合：未知 task type
+  （`ErrNoHandler`）与 payload 解码失败（`ErrInvalidPayload`）现在第一次就进 `dead`。
+
+## 两个 Go / 工具链陷阱（2026-10-15 踩到，代价是一次整包超时）
+
+- **具名返回值与 `:=` 是同一个变量**。`func startWorker(t *testing.T, w *Worker) (cancel func())`
+  里写 `ctx, cancel := context.WithCancel(...)`：`cancel` 与具名返回值在**同一个块**，
+  属于"短变量声明重声明" ⇒ **同一个变量**。末尾 `return stop` 把它改写成 `stop`。
+  而闭包捕获的是**变量不是值**，于是闭包里的 `cancel()` 实际调用 `stop` ⇒ `once.Do`
+  重入自锁，且 **ctx 从头到尾没被取消**（`Run` 一直停在 `<-ctx.Done()`）。
+  教训：有具名返回值时，内部新起同名变量前先想一秒；`cancel`/`stop` 这类名字尤其危险。
+- **不要把"等待/超时 + `t.Error`"包在 `sync.Once` 里**。Once 在闭包执行期间持有自己的
+  互斥量，任何重入都会死锁在**同一个地址**的 `Mutex.Lock` 上——dump 里只能看到
+  `Mutex.Lock` + `doSlow`，看不出是 Once 在自锁，排查成本很高。用显式布尔标记即可
+  （夹具只在测试 goroutine 上被调用，不需要更重的同步）。
+- **go-sql-driver 默认不给读写设 deadline**。DSN 缺 `timeout`/`readTimeout`/`writeTimeout`
+  时，MySQL 短暂不响应会让查询无限期挂在 `syscall.write` 上；后果不是"某条用例失败"，
+  而是**整包被 `go test` 的包级超时打掉**，日志停在半途、其余包的结果一并丢失。
+  三个入口（`migrations/mysql` 与 `store/mysql` 夹具的示例 DSN + CI 的 job 级 DSN）
+  统一带上 `timeout=5s&readTimeout=30s&writeTimeout=30s`。
+- **排查挂死先问"谁在等谁"**：dump 里 `Worker.Run` 停在 `<-ctx.Done()` 而不是停机等待
+  的那段 select，就已经说明"取消根本没发生"，范围可以直接从产品代码缩到测试夹具。
+- **同一文件的多笔编辑必须串行**：并行下发会各自基于同一份旧内容替换、后写吞掉先写，
+  而且**两笔都会返回成功**。看着像"编辑没保存"，其实是覆盖。提交后 `grep` 复核一遍。
+
+## 终态清理（§4 第 6 项，尚未开始）
+
+- 需求：`succeeded`/`dead`/`canceled` 按保留期**小批量**删除。动手前先定：
+  删除的判据列（`finished_at` 还是 `updated_at`）、批大小是否进 `Config`、
+  是否复用回收器循环还是独立 `CleanupInterval`、以及"删到一半失败"的语义。
+- 注意别和回收器抢同一批行：两者的筛选条件（终态 vs `running`）互斥，但要写进文档。
