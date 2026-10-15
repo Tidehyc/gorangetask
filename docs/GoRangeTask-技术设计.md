@@ -148,6 +148,8 @@ WHERE id = ? AND status = 'pending';
 
 每行必须恰好更新 1 行，否则回滚整个 claim 事务并记录异常。事务提交后按 ID 读取任务数据供 Worker 执行。Claim 使用的索引由 `EXPLAIN` 验证；`SKIP LOCKED` 仅用于队列领取，不能作为一般一致性查询。锁定读可能跳过被锁记录，因此该查询不提供严格 FIFO 或多队列公平性。
 
+⚠️ 上面这条锁定读**刻意只取 `id`**，目的是让它停在覆盖索引 `ix_gotask_claim (queue_name, status, run_at, id)` 上。**这是承载语义的约束，不是风格偏好**：一旦把 payload 之类的列也取出来，覆盖索引失效，`LIMIT` 就不再限制加锁范围——回收器踩过完全相同的坑，实测数据与固定手段见**附录 A**。
+
 ### 5.3 租约续期
 
 heartbeat 周期建议为 lease duration 的 1/3；默认 lease duration 30 秒、heartbeat 10 秒。调用方可配置，校验 heartbeat 小于 lease duration。
@@ -226,7 +228,7 @@ Reaper 按小批次处理 `running AND lease_until <= UTC_TIMESTAMP(6)`：事务
 
 实现注记（2026-10-15）：
 
-- **加锁读必须显式指定索引**。回收要连带取 `attempt` / `max_attempts`，这两列不在 `ix_gotask_lease` 里，因此它不是覆盖索引；实测优化器会改选全表扫描 + filesort，而 `FOR UPDATE` 在扫描过程中就把**整个积压**锁住——`LIMIT` 不再限制加锁范围，`SKIP LOCKED` 也失去意义（12 条过期任务、4 个回收器并发，只有 1 个能推进，合计只回收 3 条）。所以这条读写成 `FORCE INDEX (ix_gotask_lease)`。对照：领取的加锁读只取 `id`，对 `ix_gotask_claim` 天然覆盖，无需提示。回归用例 `TestReapLockingReadStaysOnLeaseIndex` 同时钉住计划（`EXPLAIN` 的 `key`）与行为（一个事务持锁时另一个仍取到不相交的 `limit` 行）。
+- **加锁读必须显式指定索引**。回收要连带取 `attempt` / `max_attempts`，这两列不在 `ix_gotask_lease` 里，因此它不是覆盖索引；实测优化器会改选全表扫描 + filesort，而 `FOR UPDATE` 在扫描过程中就把**整个积压**锁住——`LIMIT` 不再限制加锁范围，`SKIP LOCKED` 也失去意义（12 条过期任务、4 个回收器并发，只有 1 个能推进，合计只回收 3 条）。所以这条读写成 `FORCE INDEX (ix_gotask_lease)`。对照：领取的加锁读只取 `id`，对 `ix_gotask_claim` 天然覆盖，无需提示。**完整的事故经过、`EXPLAIN` 与 `data_locks` 实测对照、备选方案取舍见附录 A。**
 - **不动 `attempt` / `lease_epoch`**：这次领取已经用掉一次机会，回收只是给下一次让路；`epoch` 属于“领取”这个动作。
 - **守卫用读到的 `lease_until` 原值，而不是 owner/epoch**：回收器不是租约持有者，没有凭据可比。守卫不成立（影响 0 行）只跳过该行，**不返回 `ErrLeaseLost`**——那是持有者的语义，借用它会让“集群里有别的回收器在干活”看起来像故障。`lease_until` 用 `DATE_FORMAT(..., '%Y-%m-%d %H:%i:%s.%f')` 取成字符串原样带回去，避开驱动按 DSN 的 `loc` 重新格式化时间。
 
@@ -359,6 +361,7 @@ Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至
 5. 旧 epoch 的 renew/succeed/fail 更新 RowsAffected=0。
 6. 同一队列幂等键并发插入只有一条成功，其他返回 `ErrDuplicateTask`。
 7. cancel 只作用于 pending；cleanup 按保留期限删除终态任务。
+8. 每条**加锁读**（领取、回收、以及将来新增的清理）的 `EXPLAIN` 都纳入测试：断言 `key` 是预期索引，并用"一个事务持锁时另一个仍取到不相交的 `limit` 行"复核加锁范围确实受 `LIMIT` 约束。理由见附录 A——加锁范围由执行计划决定，而这在没有断言时是静默失效的。
 
 ### 8.2 故障注入
 
@@ -389,3 +392,91 @@ MVP 完成门槛：真实 MySQL 集成测试通过；事务提交/回滚和并�
 
 - MySQL 8.0 官方锁定读文档：[`SELECT ... FOR UPDATE`、`NOWAIT` 与 `SKIP LOCKED`](https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html)。MySQL 说明 `SKIP LOCKED` 会排除已锁定行，适用于多个 session 访问队列表的场景；由于读取结果可能不完整，它只用于队列领取，不用于一般一致性读取。
 - MySQL InnoDB 锁与语句扫描说明：[`Locks Set by Different SQL Statements`](https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html)。实际锁范围取决于扫描的索引记录，因此必须检查查询计划和索引。
+
+---
+
+## 附录 A. 实测记录：加锁读的加锁范围由执行计划决定（2026-10-15）
+
+**这是事故记录，不是设计预案。** 上面 §10 的参考链接里早就引用了 MySQL 的说明——"实际锁范围取决于扫描的索引记录，因此必须检查查询计划和索引"——回收器（§5.6）实现时仍然踩了进去。本节把从现象到固定的全过程与实测数字留档，供后续任何新增的加锁读（回收器、清理器、新的领取路径）对照。全部数据来自本机 **MySQL 8.0.46**。
+
+### A.1 现象
+
+回收器与它的并发用例一起跑时：**12 条过期任务、4 个回收器并发，合计只回收 3 条**，库侧终态是 `pending=3 / running=9`，且 `lease_epoch` 全为 1（说明没有任务被重新领取过，不是重复处理）。
+
+第一次误判成用例设计问题：以为 `limit` 取小了，一个回收器把允许的行抢光，其余空手而归。实际不是分配不均——**有查询在明明还有 9 条未锁行的情况下选中了 0 行**。
+
+### A.2 分层定位（每一步只回答一个问题）
+
+1. **进程侧打点**：把回收器内部逐步骤打印（`BEGIN` / `SELECT` 结果 / 每条 `UPDATE` 的影响行数 / `COMMIT`）。结果是 1 个回收器拿到 `[1,2,3]`，另外 3 个的 `SELECT` **返回空**、`COMMIT` 也报 0 行。⇒ 问题在加锁读这一层，不在写回、不在计数、不在事务边界。
+2. **SQL 层受控复现**：两个手写事务，tx1 跑完加锁读后**不提交**（锁保留），tx2 再跑同一条读。tx1 → `[1,2,3]`，tx2 → **`[]`**。⇒ 与 goroutine 调度无关，是**确定性**的锁行为（前提已核对：库里确实有 12 条 `running` 且 `lease_until` 已过期）。
+3. **锁清单**：`performance_schema.data_locks` 按连接过滤（事务内先 `SELECT CONNECTION_ID()` 取连接号）。tx1 在 `PRIMARY` 上持有**全部 12 行**的 `X,REC_NOT_GAP` 记录锁；tx2 虽然返回 0 行，却也在 `ix_gotask_lease` 上锁了 12 条索引项。⇒ `LIMIT 3` 完全没有约束住加锁范围。
+4. **执行计划**：`EXPLAIN` 给出 `type=ALL, key=NULL, Extra=Using where; Using filesort`。⇒ 这是**全表扫描 + 排序**：`FOR UPDATE` 在扫描过程中锁住每一行，`LIMIT` 只在扫描**之后**才生效。
+
+### A.3 根因
+
+回收的加锁读要连带取 `attempt` 与 `max_attempts` 来做分流（§5.6），而 `ix_gotask_lease` 是 `(status, lease_until, id)`——这两列不在索引里，因此**这条读不是覆盖索引**。优化器在"索引区间 + 回表"与"全表扫描 + 排序"之间选了后者，于是：
+
+- 加锁范围 = **扫描过的行**（整个积压），而不是 `LIMIT` 行；
+- `SKIP LOCKED` 失效：并发消费者的加锁集合几乎完全重叠，一轮下来只有一个能推进；
+- 代价随积压规模增长——**积压越大越容易卡住**，而积压大正是回收器最该起作用的时候。
+
+### A.4 证据对照
+
+12 行过期任务，索引 `ix_gotask_lease (status, lease_until, id)`，`LIMIT 3`：
+
+| 写法 | `EXPLAIN` | 实际加锁条数 |
+|---|---|---|
+| 未指定索引 | `type=ALL, key=NULL, Extra=Using where; Using filesort` | **13**（`PRIMARY` 上全部 12 行 + 表级 `IX`） |
+| 不加提示、只取索引内列（覆盖） | `type=ref, key=ix_gotask_lease, Extra=Using where; Using index` | 7 |
+| `FORCE INDEX` + 只取 `id` | `type=range, key=ix_gotask_lease, Extra=Using where; Using index` | 7 |
+| **`FORCE INDEX` + 取 4 列（最终采用）** | `type=range, key=ix_gotask_lease, Extra=Using index condition` | **7** |
+
+最终采用的写法，7 条锁的分解（逐条列出确认过）：`ix_gotask_lease` 上 3 条索引项 + `PRIMARY` 上 3 条记录锁 + 1 条表级 `IX`——**正好等于 `LIMIT` 的行数，一行不多**。
+
+行为层只对**修复后的产品 SQL** 复测过三次，结果稳定：
+
+```text
+修复前：tx1 → [1 2 3]   tx2 → []        （tx2 返回 0 行）
+修复后：tx1 → [1 2 3]   tx2 → [4 5 6]   （3 次全一致）
+```
+
+### A.5 对照：领取路径为什么没中招
+
+领取的加锁读（§5.2）**刻意只取 `id`**，对 `ix_gotask_claim (queue_name, status, run_at, id)` 天然覆盖：实测 `key=ix_gotask_claim, Extra=Using where; Using index`，`LIMIT 3` 只锁 7 条。
+
+两条查询的差别不在写法风格，只在**"有没有多取索引外的列"**。同一份设计文档里，一条遵守了覆盖索引的约束，另一条没有——这就是全部原因。
+
+### A.6 修复与取舍
+
+采用 `FORCE INDEX (ix_gotask_lease)`。备选方案与放弃理由：
+
+| 方案 | 取舍 |
+|---|---|
+| 只取 `id` + 事务内按主键补读 `attempt`/`max_attempts` | 可行，但要多一次往返，并把分流判断拆成两段 |
+| 给 `ix_gotask_lease` 补上 `attempt`/`max_attempts` 两列 | 这两列每次领取/回收都会变，挂到二级索引上等于给每次写入加一笔索引维护成本，而收益只是省掉一个提示 |
+| **`FORCE INDEX`（采用）** | 最小改动、计划确定；代价是 `ix_gotask_lease` 从此是**硬依赖**（索引被删/改名会报 `Error 1176`），因此要在 SQL 常量上写明"这是必需的，不是优化" |
+| 停机/回收时把任务写回 `pending` | **不做**。那是改语义（§5.3.1 已明确"停机不释放租约、失败不写回"），而这里只是把计划钉回原位 |
+
+### A.7 固定手段
+
+1. **计划层 + 行为层两层断言**，合在 `TestReapLockingReadStaysOnLeaseIndex`：
+   - 计划层：`EXPLAIN` 的 `key` 必须是 `ix_gotask_lease`（去掉 `FORCE INDEX` 立刻失败）；
+   - 行为层：tx1 跑完加锁读**不提交**，tx2 跑同一条读，断言它仍取到 `limit` 行、且与 tx1 **不相交**（去掉 `FORCE INDEX` 立刻返回 0 行）。
+   用两个手写事务而不是两个 Worker：要的是**确定性**，不把成败压在 goroutine 调度上。
+2. `TestReapIsSafeWithConcurrentReapers` 留作并发层验收（4 个回收器各 3 条、合计 12）。它现在也具备确定性：任一时刻最多 9 行被锁，第 4 个回收器总能拿到 3 行，所以"合计恰好 12"不是靠运气。
+3. **证伪检查**：去掉 `FORCE INDEX` → 上面两条用例都失败（分别报 `key=""` 与"合计只回收 3 条"）→ 还原后与备份 `diff` 逐字节一致。没有这一步，"用例通过"什么也不说明。
+
+### A.8 可推广的规则
+
+- **加锁读的加锁范围等于它执行计划扫过的行，与 `LIMIT` 无关。** 想限制加锁范围，就必须限制扫描范围。
+- 加锁读**优先只取索引内的列**；一旦不得不取索引外的列，就不再是覆盖索引，**必须显式指定索引**。不能把加锁范围交给优化器——**表越小它越容易选全表扫描，而这段代码要跑在大表上**。
+- `EXPLAIN` 里出现 `Using filesort`，基本可以直接判定"计划离开了预期的那条索引"（`ORDER BY` 与索引顺序一致时不该排序）。
+- 结论要用两层断言固定（计划层的 `key` + 行为层的并发不相交读取）。只做一层，将来表大小或统计信息一变，就可能"因为错误的原因通过"。
+- 新增任何加锁读时，照 §8.1 的做法把它的 `EXPLAIN` 结果纳入集成测试，而不是只在本地 `EXPLAIN` 看一眼。
+
+### A.9 溯源
+
+- 发现与修复：提交 `75c2e04`（回收器实现 + `FORCE INDEX` + 回归用例 `TestReapLockingReadStaysOnLeaseIndex`）。
+- 文档回填：提交 `af56a2f`。本附录为 2026-10-15 的独立留档（补充 A.4 的锁分解与 A.6 的备选方案取舍）。
+- 复现所需环境：MySQL 8.0.46，12 行过期任务，`LIMIT 3`，两个手写事务（步骤见 A.2 第 2 步）。
+- 相关用例：`store/mysql/worker_integration_test.go` 的 `TestReapLockingReadStaysOnLeaseIndex`、`TestReapIsSafeWithConcurrentReapers`。
