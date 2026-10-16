@@ -200,7 +200,7 @@ if err := worker.Run(ctx); err != nil {
 ```bash
 ./scripts/dev-mysql.sh up
 go run ./example/basic/cmd/demo              # 造 5 笔订单，起一个 Worker，打印进度
-go run ./example/basic/cmd/demo -orders 0    # 只起 Worker，接手之前遗留的任务
+go run ./example/basic/cmd/demo -orders 0    # 不建订单，只起 Worker 观察业务表，按 Ctrl-C 结束
 go run ./example/basic/cmd/demo -h           # 连接串、订单数、Handler 延迟、打印间隔
 ```
 
