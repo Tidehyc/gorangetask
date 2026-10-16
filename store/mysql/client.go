@@ -104,6 +104,11 @@ func New(db *sql.DB, cfg gorangetask.ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("%w: client default queue is %d characters, MySQL allows %d",
 			gorangetask.ErrInvalidConfig, n, maxQueueNameLen)
 	}
+	// nil 指标换成空实现：打点散布在 insert 与 Cancel 里，让每个调用点各自
+	// 判空既啰嗦又容易漏掉一处。
+	if cfg.Metrics == nil {
+		cfg.Metrics = gorangetask.NopMetrics{}
+	}
 	return &Client{db: db, cfg: cfg}, nil
 }
 
@@ -149,6 +154,9 @@ func (c *Client) insert(ctx context.Context, q execer, task gorangetask.Task) (g
 	if err != nil {
 		return 0, fmt.Errorf("gorangetask/store/mysql: read inserted task id: %w", err)
 	}
+	// 记的是**归一化后**的队列名：调用方留空队列时任务实际落在默认队列上，
+	// 而"落到哪儿"只有库知道。
+	c.cfg.Metrics.TaskEnqueued(p.queue)
 	return gorangetask.TaskID(id), nil
 }
 
@@ -346,6 +354,7 @@ func (c *Client) Cancel(ctx context.Context, id gorangetask.TaskID) error {
 		return fmt.Errorf("gorangetask/store/mysql: cancel task: %w", err)
 	}
 	if affected > 0 {
+		c.cfg.Metrics.TaskCanceled()
 		return nil
 	}
 

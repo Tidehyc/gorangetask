@@ -39,6 +39,14 @@ type ClaimedTask struct {
 	// Worker 配置的 HandlerTimeout。
 	Timeout time.Duration
 
+	// Wait 是这条任务的排队等待时长：从"最早可被领取"（created_at 与 run_at 的
+	// 较晚者）到它实际被领取为止，由**数据库时钟**算出。
+	//
+	// 它只服务于可观测性（Metrics.TaskWaited）。刻意在存储层算好再带出来，而不是
+	// 由 Worker 拿本地时钟减：那样各机器与数据库之间的时钟偏差会直接混进这个数，
+	// 而它衡量的恰恰是以毫秒计的系统行为（技术设计 §3.2 的时钟口径同此）。
+	Wait time.Duration
+
 	// Owner 是本次领取的持有者标识；Epoch 是本次领取的租约代数。
 	//
 	// 两者构成 fencing 凭据：写回时存储必须同时匹配 owner 与 epoch，
@@ -238,6 +246,11 @@ type Worker struct {
 
 	// rr 用于在多个监听队列之间轮转，避免总是先打同一个队列。
 	rr atomic.Uint64
+
+	// active 是当前正在执行 Handler 的数量，供 Metrics.ConcurrencyInUse 报告。
+	// 用原子量而不是普通计数：它被每个执行 goroutine 读写，且只在 process
+	// 的首尾各动一次，不值得为它引入一把锁。
+	active atomic.Int64
 }
 
 // NewWorker 构造一个 Worker。store 与 registry 不能为 nil，registry 至少要注册
@@ -257,6 +270,12 @@ func NewWorker(store WorkerStore, registry *Registry, cfg Config) (*Worker, erro
 	cfg = cfg.WithDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	// nil 指标在这里换成空实现：库内部遍布打点，让每个调用点各自判空既啰嗦
+	// 又容易漏掉一处。Logger 不做同样的替换，因为日志的单点出口（logf）已经
+	// 只有一处判空。
+	if cfg.Metrics == nil {
+		cfg.Metrics = NopMetrics{}
 	}
 	return &Worker{
 		store:    store,
@@ -440,18 +459,25 @@ func (w *Worker) loop(ctx context.Context) {
 // 会被写回存储，不作为 error 返回。
 func (w *Worker) runOnce(ctx context.Context) (int, error) {
 	queue := w.pickQueue()
+	claimStart := time.Now()
 	claimed, err := w.store.Claim(ctx, ClaimSpec{
 		Queue:         queue,
 		Limit:         w.cfg.BatchSize,
 		Owner:         w.owner,
 		LeaseDuration: w.cfg.LeaseDuration,
 	})
+	// 失败的领取也要记耗时——恰恰是它变慢（锁竞争、连接池耗尽）时最需要看见。
+	w.cfg.Metrics.ClaimLatency(time.Since(claimStart))
 	if err != nil {
 		return 0, fmt.Errorf("claim tasks: %w", err)
 	}
 	if len(claimed) > 0 {
 		w.logf(ctx, LevelDebug, "claimed tasks",
 			"worker_id", w.owner, logKeyQueue, queue, "count", len(claimed))
+		for _, task := range claimed {
+			w.cfg.Metrics.TaskClaimed(task.Queue, task.Type)
+			w.cfg.Metrics.TaskWaited(task.Queue, task.Type, task.Wait)
+		}
 	}
 
 	// 领取事务已经提交，此时任务在库里已是 running 且带着本次的 owner/epoch；
@@ -476,6 +502,11 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 	// 看护协程的启停与写回都不计入"处理耗时"。
 	start := time.Now()
 
+	// 并发池水位：进入就 +1、退出就 -1。用 defer 收尾是为了让所有提前返回的
+	// 分支（失租、停机）都不会漏掉这一次减法——漏了水位就只会单调上涨。
+	w.cfg.Metrics.ConcurrencyInUse(int(w.active.Add(1)))
+	defer func() { w.cfg.Metrics.ConcurrencyInUse(int(w.active.Add(-1))) }()
+
 	// 本次执行有两种彼此独立的提前终止原因：整个 Worker 停机（ctx）与本任务
 	// 失去租约（下面的看护协程取消 taskCtx）。用 CancelCause 把原因分开，
 	// 才能对"要不要写回"作不同判断——停机时不写回失败但成功仍确认，失租时
@@ -490,10 +521,21 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 		w.watchLease(taskCtx, stop, task, cancelTask)
 	}()
 
-	err := w.execute(taskCtx, task)
+	err, timedOut := w.execute(taskCtx, task)
 	// 耗时只计 Handler 本身（execute 的往返），不含看护停止与写回——
 	// 指标里的"处理耗时"要回答的是"Handler 干了多久"。
 	elapsed := time.Since(start)
+
+	// panic 与超时都只是**普通的失败**（照常走重试或死信，也会计进 TaskFinished），
+	// 这里额外记一次诊断计数：它们分别指向"Handler 有 bug"与"超时/容量需要调整"，
+	// 混在失败总数里就看不出来了。
+	var panicked *panicError
+	if errors.As(err, &panicked) {
+		w.cfg.Metrics.HandlerPanicked(task.Queue, task.Type)
+	}
+	if timedOut {
+		w.cfg.Metrics.HandlerTimedOut(task.Queue, task.Type)
+	}
 
 	// 先停看护、等它退出，再写回。反过来的话，续租可能在任务已经写成终态之后
 	// 才到达，因 status 不再是 running 而返回 ErrLeaseLost，凭空报出一条错误；
@@ -505,6 +547,7 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 	// 无论成功与否都不能再写（写也只会被 fencing 拒掉）。任务保持 running，
 	// 交给回收器按新租约处理。
 	if cause := context.Cause(taskCtx); errors.Is(cause, ErrLeaseLost) {
+		w.cfg.Metrics.LeaseLost(task.Queue, task.Type)
 		w.report(ctx, fmt.Errorf(
 			"task %d lost its lease while running; leaving it to the reaper: %w", task.ID, cause))
 		return
@@ -615,10 +658,11 @@ func (w *Worker) reapLoop(ctx context.Context) {
 			w.report(ctx, fmt.Errorf("reap expired leases: %w", err))
 			continue
 		}
-		// 只在真有回收动作时记一条。回收平时是静默的（绝大多数轮次返回 0），
-		// 每轮都记反而会把"真的捡回了任务"那一次埋在噪音里——而那次正是运维
-		// 需要看到"有 Worker 崩溃过"的唯一线索。
+		// 只在真有回收动作时记一次。这是"回收发生了"的事件语义，实现方直接按
+		// 传入的条数递增即可，不必自己判零；日志用同一条件，免得"真的捡回了任务"
+		// 那一次被零值噪音埋掉——而它正是运维需要看到"有 Worker 崩溃过"的唯一线索。
 		if result.ToPending > 0 || result.ToDead > 0 {
+			w.cfg.Metrics.TasksReaped(result.ToPending, result.ToDead)
 			w.logf(ctx, LevelInfo, "expired leases reaped",
 				logKeyWorkerID, w.owner,
 				"to_pending", result.ToPending,
@@ -695,8 +739,9 @@ func (w *Worker) runCleanupRound(ctx context.Context) {
 			}
 		}
 		// 清理是例行工作，记 debug：它每天都会发生，按 info 记会让日志满是
-		// "删了 N 行"。真需要按量告警时用指标，不必靠日志。
+		// "删了 N 行"。真需要按量告警时用指标（同一条件），不必靠日志。
 		if total > 0 {
+			w.cfg.Metrics.TasksCleaned(spec.Status, total)
 			w.logf(ctx, LevelDebug, "finished tasks cleaned",
 				logKeyWorkerID, w.owner, "status", string(spec.Status), "deleted", total)
 		}
@@ -740,26 +785,43 @@ func (w *Worker) ack(ctx context.Context, task ClaimedTask, elapsed time.Duratio
 	if err := w.store.Succeed(ackCtx, task); err != nil {
 		// 写回失败通常是租约过期/易主（ErrLeaseLost）。按设计不做无条件更新补救，
 		// 任务的最终命运交给回收器。
+		w.noteLeaseLostOnWriteBack(task, err)
 		w.report(ctx, fmt.Errorf("ack success for task %d: %w", task.ID, err))
 		return
 	}
-	// "成功"这条日志只在写回真的落地之后记：Succeed 被 fencing 拒掉时任务并没有
-	// 成功，此时记一条 succeeded 会让日志与库里的状态互相矛盾。
+	// 指标与日志都只在写回真的落地之后记：Succeed 被 fencing 拒掉时任务并没有
+	// 成功，记一条 succeeded 会让观测数据与库里的状态互相矛盾。
+	w.cfg.Metrics.TaskFinished(task.Queue, task.Type, OutcomeSucceeded, elapsed)
 	w.logf(ctx, LevelInfo, "task succeeded",
 		append(w.taskLogFields(task), "duration", elapsed)...)
 }
 
-// execute 解析 Handler 并在超时 context 下运行它。
+// noteLeaseLostOnWriteBack 在写回因租约已易主被拒时补记一次失租。
+//
+// process 里那次失租检测的是**续租**被拒；这里是**写回**被拒。两者在同一次执行里
+// 互斥——续租被拒后 process 直接返回、不再写回——所以一次失租只会记一次。
+func (w *Worker) noteLeaseLostOnWriteBack(task ClaimedTask, err error) {
+	if errors.Is(err, ErrLeaseLost) {
+		w.cfg.Metrics.LeaseLost(task.Queue, task.Type)
+	}
+}
+
+// execute 解析 Handler 并在超时 context 下运行它，返回它的错误以及
+// "它是不是因为执行超时被取消的"。
 //
 // 超时取 task.Timeout（入队时持久化、领取时还原）；为 0 表示没设置，
 // 回落到 Worker 配置的 HandlerTimeout。runCtx 派生自 ctx（即本次执行的
 // taskCtx），因此停机、逐任务超时、失去租约这三种取消都能传到 Handler 手里
 // ——它们是同一套协作式取消，谁先发生谁生效，Handler 可用 context.Cause
 // 分辨自己是被谁叫停的。
-func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
+//
+// 第二个返回值**只**为可观测性而存在（Metrics.HandlerTimedOut）：超时与否以
+// runCtx 的取消原因为准，而不是看 Handler 返回了什么错误——Handler 完全可能在
+// 超时之后又返回一个不相干的错误，而我们要计数的是"它因超时被叫停"这件事本身。
+func (w *Worker) execute(ctx context.Context, task ClaimedTask) (error, bool) {
 	handler, err := w.registry.Resolve(task.Type)
 	if err != nil {
-		return err
+		return err, false
 	}
 
 	timeout := task.Timeout
@@ -769,7 +831,8 @@ func (w *Worker) execute(ctx context.Context, task ClaimedTask) error {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return runHandler(handler, runCtx, task.Payload)
+	execErr := runHandler(handler, runCtx, task.Payload)
+	return execErr, errors.Is(context.Cause(runCtx), context.DeadlineExceeded)
 }
 
 // panicStackLines 是 panic 堆栈写入 last_error 时的最大行数。
@@ -799,9 +862,24 @@ func runHandler(handler Handler, ctx context.Context, payload json.RawMessage) (
 		if r == nil {
 			return
 		}
-		err = fmt.Errorf("handler panicked: %v\n%s", r, panicStack())
+		err = &panicError{value: r, stack: panicStack()}
 	}()
 	return handler(ctx, payload)
+}
+
+// panicError 是 Handler panic 被兜底转换出的错误。
+//
+// 用**类型**而不是给消息加前缀，是因为指标与日志都需要判断"这次失败是不是
+// panic"；靠匹配 "handler panicked: " 这个前缀会在哪天改了措辞时静默失效，
+// 而那正是这段代码最该可靠的时候。错误文案与引入类型之前逐字一致，因此既有
+// 断言（含 example 里那条）不受影响。
+type panicError struct {
+	value any
+	stack string
+}
+
+func (e *panicError) Error() string {
+	return fmt.Sprintf("handler panicked: %v\n%s", e.value, e.stack)
 }
 
 // panicStack 返回截断后的 panic 堆栈（不含首行的 goroutine 头）。
@@ -846,9 +924,11 @@ func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error, elapse
 
 	delay := w.retryDelay(task.Attempt)
 	if err := w.store.Retry(ctx, task, delay, summary); err != nil {
+		w.noteLeaseLostOnWriteBack(task, err)
 		w.report(ctx, fmt.Errorf("retry task %d: %w", task.ID, err))
 		return
 	}
+	w.cfg.Metrics.TaskFinished(task.Queue, task.Type, OutcomeRetried, elapsed)
 	w.logf(ctx, LevelWarn, "task failed; retry scheduled",
 		append(w.taskLogFields(task), "delay", delay, logKeyError, cause)...)
 }
@@ -859,9 +939,11 @@ func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error, elapse
 // 此时记一条"已死信"会让日志与库里的状态互相矛盾。
 func (w *Worker) markDead(ctx context.Context, task ClaimedTask, cause error, elapsed time.Duration) {
 	if err := w.store.MarkDead(ctx, task, cause.Error()); err != nil {
+		w.noteLeaseLostOnWriteBack(task, err)
 		w.report(ctx, fmt.Errorf("mark task %d dead: %w", task.ID, err))
 		return
 	}
+	w.cfg.Metrics.TaskFinished(task.Queue, task.Type, OutcomeDead, elapsed)
 	w.logf(ctx, LevelWarn, "task marked dead",
 		append(w.taskLogFields(task), "duration", elapsed, logKeyError, cause)...)
 }

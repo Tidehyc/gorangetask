@@ -56,11 +56,17 @@ const markRunningSQL = `UPDATE ` + tasksTable + `
     WHERE id = ? AND status = 'pending'`
 
 // selectClaimedTaskSQL 在领取事务提交后按主键回读整行，供 Worker 执行。
+//
 // timeout_ns 一并取回：逐任务超时要靠它还原，否则重启或重新领取后就只剩
 // Worker 的默认值了。
+//
+// 最后一列是排队等待时长，直接由数据库时钟算出（从 GREATEST(created_at, run_at)
+// 到此刻的微秒数）。取"最早可被领取"而不是 created_at：延迟任务在 run_at 之前
+// 本来就不该被领取，把它刻意安排的等待算进"排队延迟"会污染这个指标。
 const selectClaimedTaskSQL = `SELECT
     queue_name, task_type, payload, attempt, max_attempts, timeout_ns,
-    lease_owner, lease_epoch
+    lease_owner, lease_epoch,
+    TIMESTAMPDIFF(MICROSECOND, GREATEST(created_at, run_at), UTC_TIMESTAMP(6))
 FROM ` + tasksTable + ` WHERE id = ?`
 
 // 下面三条是状态写回语句，共用同一组 fencing 条件：
@@ -324,11 +330,12 @@ func (c *Client) readClaimedTask(ctx context.Context, id int64) (gorangetask.Cla
 		timeoutNs       sql.NullInt64
 		owner           sql.NullString
 		leaseEpoch      uint64
+		waitMicros      int64
 	)
 
 	err := c.db.QueryRowContext(ctx, selectClaimedTaskSQL, id).Scan(
 		&queue, &taskType, &payload, &task.Attempt, &task.MaxAttempts, &timeoutNs,
-		&owner, &leaseEpoch,
+		&owner, &leaseEpoch, &waitMicros,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -354,6 +361,10 @@ func (c *Client) readClaimedTask(ctx context.Context, id int64) (gorangetask.Cla
 	}
 	task.Owner = owner.String
 	task.Epoch = leaseEpoch
+	// 直接用 int64 扫描而不是 sql.NullInt64：created_at 与 run_at 都是 NOT NULL，
+	// GREATEST 不可能返回 NULL。真出现 NULL 时让扫描当场报错，好过静默传一个 0
+	// 出去——那会把"数据坏了"伪装成"这条任务没排队"。
+	task.Wait = time.Duration(waitMicros) * time.Microsecond
 	return task, nil
 }
 

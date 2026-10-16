@@ -149,6 +149,10 @@ type Config struct {
 	// nil 是**合法且默认**的取值，因此 WithDefaults 不会给它填默认值，Validate
 	// 也不校验它——"要不要日志"是部署决定，不是配置错误。
 	Logger Logger
+
+	// Metrics 接收 Worker 产生的指标事件；为 nil 时会在构造期被替换成
+	// NopMetrics，因此库内部的调用点不必各自判空。
+	Metrics Metrics
 }
 
 // WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。
@@ -323,6 +327,13 @@ type ClientConfig struct {
 
 	// MaxPayloadSize 是单个任务 payload 的字节上限。必须大于 0。
 	MaxPayloadSize int
+
+	// Metrics 接收入队与取消产生的指标事件；为 nil 时会在构造期被替换成
+	// NopMetrics，因此实现内部的调用点不必各自判空。
+	//
+	// 取消没有队列标签（见 Metrics.TaskCanceled 的说明）；入队带的是**归一化后**
+	// 的队列名，也就是任务实际落入的那个队列。
+	Metrics Metrics
 }
 
 // WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。
