@@ -204,6 +204,92 @@ go run ./example/basic/cmd/demo -orders 0    # 不建订单，只起 Worker 观�
 go run ./example/basic/cmd/demo -h           # 连接串、订单数、Handler 延迟、打印间隔
 ```
 
+## 故障演示：停机打断 → 租约过期 → 换人接手
+
+「至少一次」不是口号。进程在 Handler 跑到一半时消失，那条任务会**原样留在 `running`**，
+直到租约过期、并且**有一个活着的 Worker 在跑回收器**把它捡回来。
+
+`example/basic` 的入口带了 `-lease` / `-reap` 两个开关，专门把这条路径压进几秒。下面每一步都是实测输出。
+
+**第一幕：起一个 Worker，让 Handler 慢一点，然后在它跑完之前按 Ctrl-C。**
+
+```bash
+go run ./example/basic/cmd/demo -orders 2 -handler-delay 30s -lease 5s -reap 2s
+```
+
+```text
+created order 1 (task 1) in one transaction
+created order 2 (task 2) in one transaction
+worker started; press Ctrl-C to stop (watching every 1s)
+
+order  status   task  status   attempt  error
+1      pending  1     running  1
+2      pending  2     running  1
+...
+```
+
+按 Ctrl-C，收尾是这样的：
+
+```text
+shutting down: interrupted
+task 1 (order 1) is still running
+task 2 (order 2) is still running
+
+2 task(s) left unfinished. They stay as-is until the lease expires,
+then the reaper hands them back to the queue. Restart with `-orders 0` to
+watch a fresh worker pick them up (see README.md).
+```
+
+业务行还是 `pending`、任务行是 `running`、`attempt` 停在 `1`：Handler 一收到取消就收手，没有写回任何业务结果。查库能看到租约还剩多久：
+
+```text
+id  status   attempt  lease_until                 now_utc
+1   running  1        2026-10-16 08:15:49.200823  2026-10-16 08:15:44.394506
+2   running  1        2026-10-16 08:15:49.202704  2026-10-16 08:15:44.394506
+```
+
+**等几秒让租约到期**——`-lease 5s` 且心跳是租约的 1/3，所以租约最晚在停机后 5 秒内到期——再查一次：
+
+```text
+id  status   attempt  lease_until                 now_utc
+1   running  1        2026-10-16 08:15:49.200823  2026-10-16 08:15:50.551951
+2   running  1        2026-10-16 08:15:49.202704  2026-10-16 08:15:50.551951
+```
+
+`lease_until` 已经落在 `now_utc` 后面了，但状态**还是 `running`——租约到期本身什么都不改变**。
+此刻集群里没有任何 Worker，也就没有人在回收。这正是回收器存在的理由，也是"光有租约不够"的地方。
+
+**第二幕：换一个 Worker 起来，这次不建订单，只观察业务表。**
+
+```bash
+go run ./example/basic/cmd/demo -orders 0 -lease 5s -reap 2s
+```
+
+```text
+order  customer     amount_cents  status   exported_at
+1      customer-01  1999          pending  -
+2      customer-02  3998          pending  -
+...
+
+order  customer     amount_cents  status    exported_at
+1      customer-01  1999          exported  2026-10-16T08:15:52.928231Z
+2      customer-02  3998          exported  2026-10-16T08:15:52.967856Z
+```
+
+起来约 2 秒（一个 `-reap 2s` 周期）后，回收器把两笔过期租约放回 `pending`，同一个 Worker 随即领取、
+跑完 Handler，业务行翻成 `exported`。收尾查库：
+
+```text
+id  status     attempt  lease_until  now_utc
+1   succeeded  2        NULL         2026-10-16 08:16:00.733618
+2   succeeded  2        NULL         2026-10-16 08:16:00.733618
+```
+
+`attempt` 从 1 变成 2，就是"同一条任务被领过两次"的直接证据——所以 Handler 必须幂等。
+
+> 两个开关只服务于演示。默认是 `LeaseDuration 30s` / `ReapInterval 30s`，照默认跑这条路径要等几十秒；
+> 生产里这个量级才合理——租约太短，一次 GC 停顿或网络抖动就会被误判成"进程崩了"。
+
 ## 文档
 
 - [需求文档](docs/GoRangeTask-需求文档.md)：项目目标、MVP 范围、状态机、API 草案、可观测性和验收标准。
