@@ -3,7 +3,7 @@
 //
 //	go run ./example/basic/cmd/demo
 //	go run ./example/basic/cmd/demo -orders 3 -watch 500ms
-//	go run ./example/basic/cmd/demo -orders 0            # 只起 Worker，接手遗留任务
+//	go run ./example/basic/cmd/demo -orders 0            # 不建订单，只起 Worker 观察业务表
 //
 // 连接串从 GOTASK_EXAMPLE_DSN 读，缺省用 scripts/dev-mysql.sh 起的本地容器。
 //
@@ -67,7 +67,7 @@ func parseFlags() options {
 	var opts options
 
 	flag.StringVar(&opts.dsn, "dsn", "", "MySQL DSN（缺省读 "+dsnEnv+"，再缺省用本地开发容器）")
-	flag.IntVar(&opts.orders, "orders", 5, "启动时创建的订单数；0 表示只起 Worker，接手之前遗留的任务")
+	flag.IntVar(&opts.orders, "orders", 5, "启动时创建的订单数；0 表示不创建订单，只起 Worker 并把业务表铺开观察，按 Ctrl-C 结束")
 	flag.DurationVar(&opts.handlerDelay, "handler-delay", 0,
 		"导出 Handler 在写回前先等待多久（用于演示停机打断在途任务）")
 	flag.DurationVar(&opts.watch, "watch", time.Second, "打印状态的间隔")
@@ -140,9 +140,9 @@ func createOrders(ctx context.Context, app *basic.App, n int) ([]trackedOrder, e
 	return tracked, nil
 }
 
-// watch 按 watch 间隔打印进度，返回停机原因。
+// watch 按 watch 间隔打印状态，返回停机原因。
 //
-// 结束条件有三个：所有订单都导出完成（主动请求停机）、用户按了 Ctrl-C
+// 结束条件有三个：本次创建的订单全部导出完成（主动请求停机）、用户按了 Ctrl-C
 // （signal.NotifyContext 取消 ctx），或 Worker 自己先退了（基础设施问题，
 // 启动它的那个 goroutine 会顺手取消 ctx）。
 //
@@ -160,7 +160,13 @@ func watch(ctx context.Context, stop context.CancelFunc, app *basic.App, tracked
 			}
 			return "interrupted"
 		case <-ticker.C:
-			allDone, err := printProgress(ctx, app, tracked)
+			var allDone bool
+			var err error
+			if len(tracked) == 0 {
+				err = printOrders(ctx, app)
+			} else {
+				allDone, err = printProgress(ctx, app, tracked)
+			}
 			if err != nil {
 				// 打印失败（比如连接断了）不该让整个 demo 崩掉：说明白然后走收尾，
 				// 让停机路径把最终状态再报一次。
@@ -168,12 +174,58 @@ func watch(ctx context.Context, stop context.CancelFunc, app *basic.App, tracked
 				stop()
 				return "progress read failed"
 			}
-			if allDone {
+			if reason, stopNow := stopReason(len(tracked), allDone); stopNow {
 				stop() // 已经没事可做了，请求优雅停机。
-				return "all orders exported"
+				return reason
 			}
 		}
 	}
+}
+
+// stopReason 判断这一轮要不要主动请求停机。
+//
+// **`-orders 0` 时永远不停机**：那种模式下本次没有创建任何订单，"全都完成了"是句
+// 空话，如果不特判，第一次 tick 就会立刻退出——完全看不到 Worker 接手遗留任务的过程。
+// 这一条是踩过的坑：`-orders 0` 起不到"只起 Worker 观察"的作用，按 Ctrl-C 才是它的
+// 结束方式。抽成纯函数是为了让这条规则能被单测钉住（见 main_test.go）。
+func stopReason(tracked int, allDone bool) (string, bool) {
+	if tracked == 0 {
+		return "", false
+	}
+	if allDone {
+		return "all orders exported", true
+	}
+	return "", false
+}
+
+// ordersListLimit 是 -orders 0 模式下每次列举的订单条数上限。
+const ordersListLimit = 20
+
+// printOrders 平铺业务侧的订单表。
+//
+// `-orders 0` 时用得上：那些订单不是本进程创建的，因此拿不到它们的任务 ID——公开 API
+// 只提供"按 ID 查任务"，没有"按队列列举"。好在故障演示关心的是业务记录从 pending 变成
+// exported 的那一下，而它正是任务确实被接手的证据。
+func printOrders(ctx context.Context, app *basic.App) error {
+	orders, err := app.Store.ListOrders(ctx, ordersListLimit)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "order\tcustomer\tamount_cents\tstatus\texported_at")
+	for _, order := range orders {
+		exportedAt := "-"
+		if order.ExportedAt.Valid {
+			exportedAt = order.ExportedAt.Time.Format(time.RFC3339Nano)
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\n",
+			order.ID, order.Customer, order.AmountCents, order.Status, exportedAt)
+	}
+	if len(orders) == 0 {
+		fmt.Fprintln(w, "(no orders)")
+	}
+	return w.Flush()
 }
 
 // printProgress 打印一行一行的状态表，返回"是否所有订单都已导出完成"。
