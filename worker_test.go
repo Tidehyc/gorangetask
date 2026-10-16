@@ -35,6 +35,11 @@ type fakeStore struct {
 	reapLimits []int
 	reapErr    error
 
+	// reapResult 是可注入的回收计数；为 nil 时返回零值（"这一轮什么都没捡到"），
+	// 因此既有用例的行为不变。根包现在会**解释**这两个数——只在非零时记一条
+	// 日志，于是需要能制造"真的回收了任务"的场景。
+	reapResult *ReapResult
+
 	// onReap 在记录完一次回收调用后执行，供用例做同步点，或制造"回收恰好在
 	// 停机瞬间失败"这类只在特定时序下出现的路径。
 	onReap func(ctx context.Context, call int, limit int)
@@ -185,7 +190,7 @@ func (f *fakeStore) RenewLease(ctx context.Context, task ClaimedTask, _ time.Dur
 }
 
 // ReapExpiredLeases 记录一次回收调用，并调用 onReap 供用例同步。
-// 回收的返回计数在这里恒为零值：根包并不解释它，只是把它交给调用方。
+// 返回的计数缺省为零值（"什么都没捡到"），可用 reapResult 注入非零值。
 func (f *fakeStore) ReapExpiredLeases(ctx context.Context, limit int) (ReapResult, error) {
 	if err := f.ctxErr(ctx); err != nil {
 		return ReapResult{}, err
@@ -194,11 +199,14 @@ func (f *fakeStore) ReapExpiredLeases(ctx context.Context, limit int) (ReapResul
 	f.mu.Lock()
 	f.reapLimits = append(f.reapLimits, limit)
 	call := len(f.reapLimits)
-	hook, err := f.onReap, f.reapErr
+	hook, err, result := f.onReap, f.reapErr, f.reapResult
 	f.mu.Unlock()
 
 	if hook != nil {
 		hook(ctx, call, limit)
+	}
+	if result != nil {
+		return *result, err
 	}
 	return ReapResult{}, err
 }

@@ -143,6 +143,12 @@ type Config struct {
 	// DefaultCleanupInterval，因此"不设置"与"关闭"是两个不同的表达——语义与
 	// ReapInterval 保持一致。
 	CleanupInterval time.Duration
+
+	// Logger 接收 Worker 产生的结构化日志；为 nil 时静默。
+	//
+	// nil 是**合法且默认**的取值，因此 WithDefaults 不会给它填默认值，Validate
+	// 也不校验它——"要不要日志"是部署决定，不是配置错误。
+	Logger Logger
 }
 
 // WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。

@@ -215,9 +215,15 @@ type WorkerStore interface {
 // 集群里每个 Worker 都会回收，并发安全由存储层的 SKIP LOCKED 与租约值守卫保证
 // （见 WorkerStore.ReapExpiredLeases）。
 //
-// 尚未实现的语义（后续工作项，文档已排期）：
-//   - **可观测性（§5）**：基础设施错误目前没有公开出口，只能通过内部 onError 观察；
-//     ReapResult 的两个计数也还没有消费方。
+// # 可观测性
+//
+// 配置了 Config.Logger 时，Worker 会把生命周期事件与基础设施错误记成结构化日志：
+// 领取、成功、重试、死信、失去租约、回收与清理的每轮结果、以及停机过程。字段名
+// 是稳定的 snake_case（task_id / task_type / queue / attempt / max_attempts /
+// lease_epoch / worker_id），与需求 §8 对齐；**payload 永不进入日志**。
+//
+// 未配置 Logger 时全程静默——"要不要日志"是部署决定。内部字段 onError 只是本包
+// 测试用的观察缝隙（记为 error 级日志的同时也会调用它），不是给调用方的出口。
 type Worker struct {
 	store    WorkerStore
 	registry *Registry
@@ -225,8 +231,9 @@ type Worker struct {
 	owner    string
 
 	// onError 接收与单个任务无关的基础设施错误（领取失败、写回失败等）。
-	// 目前没有公开的日志出口，这里是留给自己与测试的内部缝隙，默认丢弃；
-	// §5「结构化日志」会把它换成真正的日志句柄。
+	//
+	// 它是**测试用的内部观察缝隙**，不是公开出口：生产环境请用 Config.Logger。
+	// report 在调用它的同时也记一条 error 级日志。
 	onError func(error)
 
 	// rr 用于在多个监听队列之间轮转，避免总是先打同一个队列。
@@ -291,6 +298,14 @@ func NewWorker(store WorkerStore, registry *Registry, cfg Config) (*Worker, erro
 // 单个任务执行失败不会中断循环：失败会被写回存储（pending 重试或 dead）。
 // 正常停机（所有 Handler 都在 ShutdownTimeout 内退出）返回 nil。
 func (w *Worker) Run(ctx context.Context) error {
+	w.logf(ctx, LevelInfo, "worker started",
+		"worker_id", w.owner,
+		"queues", w.cfg.Queues,
+		"concurrency", w.cfg.Concurrency,
+		"reaper_enabled", w.reaperEnabled(),
+		"cleanup_enabled", w.cleanupEnabled(),
+	)
+
 	var wg sync.WaitGroup
 	for i := 0; i < w.cfg.Concurrency; i++ {
 		wg.Add(1)
@@ -332,6 +347,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
+	// 停机日志用脱离取消的 context：这行之后 ctx 已经是取消态，而"开始停机"这条
+	// 消息恰恰是最后一个必须写出去的事件。日志实现若检查 ctx 也不会把它丢掉。
+	w.logf(context.WithoutCancel(ctx), LevelInfo, "worker stopping",
+		"worker_id", w.owner, "timeout", w.cfg.ShutdownTimeout)
 
 	// 在途 Handler 拿到的 context 派生自 ctx，取消已经传到它们手里；这里只等
 	// 它们在 ShutdownTimeout 内返回，不为不理会取消的 Handler 无限期阻塞。
@@ -350,8 +369,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-cleanupDone:
 			cleanupStopped, cleanupDone = true, nil
 		case <-timer.C:
-			return fmt.Errorf("%w: %s elapsed with %s", ErrShutdownTimeout, w.cfg.ShutdownTimeout,
-				stillRunning(handlersStopped, reaperStopped, cleanupStopped))
+			// 这句与下面返回的错误用同一个 reason，保证日志与调用方拿到的
+			// 错误说的是同一件事（两侧各算一次容易改一处忘一处）。
+			reason := stillRunning(handlersStopped, reaperStopped, cleanupStopped)
+			w.logf(context.WithoutCancel(ctx), LevelError, "shutdown timed out",
+				"worker_id", w.owner, "timeout", w.cfg.ShutdownTimeout, "still_running", reason)
+			return fmt.Errorf("%w: %s elapsed with %s", ErrShutdownTimeout, w.cfg.ShutdownTimeout, reason)
 		}
 	}
 	return nil
@@ -398,7 +421,7 @@ func (w *Worker) loop(ctx context.Context) {
 			return
 		}
 		if err != nil {
-			w.report(err)
+			w.report(ctx, err)
 			backoff = w.sleep(ctx, backoff)
 			continue
 		}
@@ -416,14 +439,19 @@ func (w *Worker) loop(ctx context.Context) {
 // 返回的 error 只表示"领取"本身失败（基础设施问题）；单条任务的执行失败
 // 会被写回存储，不作为 error 返回。
 func (w *Worker) runOnce(ctx context.Context) (int, error) {
+	queue := w.pickQueue()
 	claimed, err := w.store.Claim(ctx, ClaimSpec{
-		Queue:         w.pickQueue(),
+		Queue:         queue,
 		Limit:         w.cfg.BatchSize,
 		Owner:         w.owner,
 		LeaseDuration: w.cfg.LeaseDuration,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("claim tasks: %w", err)
+	}
+	if len(claimed) > 0 {
+		w.logf(ctx, LevelDebug, "claimed tasks",
+			"worker_id", w.owner, logKeyQueue, queue, "count", len(claimed))
 	}
 
 	// 领取事务已经提交，此时任务在库里已是 running 且带着本次的 owner/epoch；
@@ -433,7 +461,7 @@ func (w *Worker) runOnce(ctx context.Context) (int, error) {
 		// 取消的 context，等于把任务领出来又立刻放弃。保持 running 交给回收器，
 		// 比"启动了再取消"更干净。
 		if ctx.Err() != nil {
-			w.report(fmt.Errorf("shutdown in progress; %d claimed task(s) left running for the reaper", len(claimed)-i))
+			w.report(ctx, fmt.Errorf("shutdown in progress; %d claimed task(s) left running for the reaper", len(claimed)-i))
 			break
 		}
 		w.process(ctx, task)
@@ -444,6 +472,10 @@ func (w *Worker) runOnce(ctx context.Context) (int, error) {
 // process 执行一条已领取的任务并写回结果。它不返回 error：任务的失败是
 // 预期内的结果，写回存储即可；写回本身失败才通过 report 上报。
 func (w *Worker) process(ctx context.Context, task ClaimedTask) {
+	// 计时只覆盖 Handler 本身：start 在这里取，elapsed 在 execute 返回后立刻算，
+	// 看护协程的启停与写回都不计入"处理耗时"。
+	start := time.Now()
+
 	// 本次执行有两种彼此独立的提前终止原因：整个 Worker 停机（ctx）与本任务
 	// 失去租约（下面的看护协程取消 taskCtx）。用 CancelCause 把原因分开，
 	// 才能对"要不要写回"作不同判断——停机时不写回失败但成功仍确认，失租时
@@ -459,6 +491,9 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 	}()
 
 	err := w.execute(taskCtx, task)
+	// 耗时只计 Handler 本身（execute 的往返），不含看护停止与写回——
+	// 指标里的"处理耗时"要回答的是"Handler 干了多久"。
+	elapsed := time.Since(start)
 
 	// 先停看护、等它退出，再写回。反过来的话，续租可能在任务已经写成终态之后
 	// 才到达，因 status 不再是 running 而返回 ErrLeaseLost，凭空报出一条错误；
@@ -470,7 +505,7 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 	// 无论成功与否都不能再写（写也只会被 fencing 拒掉）。任务保持 running，
 	// 交给回收器按新租约处理。
 	if cause := context.Cause(taskCtx); errors.Is(cause, ErrLeaseLost) {
-		w.report(fmt.Errorf(
+		w.report(ctx, fmt.Errorf(
 			"task %d lost its lease while running; leaving it to the reaper: %w", task.ID, cause))
 		return
 	}
@@ -479,18 +514,18 @@ func (w *Worker) process(ctx context.Context, task ClaimedTask) {
 	// （写回 pending 会让别的 Worker 在旧副作用可能仍在途时立刻重跑）。
 	if ctx.Err() != nil {
 		if err == nil {
-			w.ack(ctx, task)
+			w.ack(ctx, task, elapsed)
 			return
 		}
-		w.report(fmt.Errorf("shutdown in progress; task %d left running for the reaper: %w", task.ID, err))
+		w.report(ctx, fmt.Errorf("shutdown in progress; task %d left running for the reaper: %w", task.ID, err))
 		return
 	}
 
 	if err != nil {
-		w.fail(ctx, task, err)
+		w.fail(ctx, task, err, elapsed)
 		return
 	}
-	w.ack(ctx, task)
+	w.ack(ctx, task, elapsed)
 }
 
 // watchLease 为一条在途任务按 Config.HeartbeatInterval 续租，直到 stop 被关闭
@@ -537,7 +572,7 @@ func (w *Worker) watchLease(ctx context.Context, stop <-chan struct{}, task Clai
 		if ctx.Err() != nil {
 			return
 		}
-		w.report(fmt.Errorf("renew lease for task %d: %w", task.ID, err))
+		w.report(ctx, fmt.Errorf("renew lease for task %d: %w", task.ID, err))
 	}
 }
 
@@ -577,12 +612,19 @@ func (w *Worker) reapLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			w.report(fmt.Errorf("reap expired leases: %w", err))
+			w.report(ctx, fmt.Errorf("reap expired leases: %w", err))
 			continue
 		}
-		// 计数暂时没有消费方：Worker 目前没有日志出口，§5「结构化日志」接进来
-		// 时这两个数会成为最有价值的一条。真库测试会直接断言它们。
-		_ = result
+		// 只在真有回收动作时记一条。回收平时是静默的（绝大多数轮次返回 0），
+		// 每轮都记反而会把"真的捡回了任务"那一次埋在噪音里——而那次正是运维
+		// 需要看到"有 Worker 崩溃过"的唯一线索。
+		if result.ToPending > 0 || result.ToDead > 0 {
+			w.logf(ctx, LevelInfo, "expired leases reaped",
+				logKeyWorkerID, w.owner,
+				"to_pending", result.ToPending,
+				"to_dead", result.ToDead,
+			)
+		}
 	}
 }
 
@@ -636,6 +678,7 @@ func (w *Worker) cleanupLoop(ctx context.Context) {
 // 抖动顺带把 dead 的清理也停掉没有道理。
 func (w *Worker) runCleanupRound(ctx context.Context) {
 	for _, spec := range w.cleanupSpecs() {
+		var total int64
 		for i := 0; i < cleanupMaxBatches; i++ {
 			deleted, err := w.store.CleanupFinished(ctx, spec)
 			if err != nil {
@@ -643,12 +686,19 @@ func (w *Worker) runCleanupRound(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				w.report(fmt.Errorf("cleanup %s tasks: %w", spec.Status, err))
+				w.report(ctx, fmt.Errorf("cleanup %s tasks: %w", spec.Status, err))
 				break
 			}
+			total += deleted
 			if deleted < int64(spec.Limit) {
 				break
 			}
+		}
+		// 清理是例行工作，记 debug：它每天都会发生，按 info 记会让日志满是
+		// "删了 N 行"。真需要按量告警时用指标，不必靠日志。
+		if total > 0 {
+			w.logf(ctx, LevelDebug, "finished tasks cleaned",
+				logKeyWorkerID, w.owner, "status", string(spec.Status), "deleted", total)
 		}
 	}
 }
@@ -683,15 +733,20 @@ func (w *Worker) cleanupSpecs() []CleanupSpec {
 //  3. 顺带把"数据库卡住"的边界也收紧成有界等待，与续租的做法一致（见 watchLease）。
 //
 // 失租时不写回，由调用方（process）在进入本函数之前判掉。
-func (w *Worker) ack(ctx context.Context, task ClaimedTask) {
+func (w *Worker) ack(ctx context.Context, task ClaimedTask, elapsed time.Duration) {
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := w.store.Succeed(ackCtx, task); err != nil {
 		// 写回失败通常是租约过期/易主（ErrLeaseLost）。按设计不做无条件更新补救，
 		// 任务的最终命运交给回收器。
-		w.report(fmt.Errorf("ack success for task %d: %w", task.ID, err))
+		w.report(ctx, fmt.Errorf("ack success for task %d: %w", task.ID, err))
+		return
 	}
+	// "成功"这条日志只在写回真的落地之后记：Succeed 被 fencing 拒掉时任务并没有
+	// 成功，此时记一条 succeeded 会让日志与库里的状态互相矛盾。
+	w.logf(ctx, LevelInfo, "task succeeded",
+		append(w.taskLogFields(task), "duration", elapsed)...)
 }
 
 // execute 解析 Handler 并在超时 context 下运行它。
@@ -780,25 +835,35 @@ func panicStack() string {
 // 找不到 Handler（Registry.Resolve 返回永久 ErrNoHandler）与 payload 解码失败
 // （TypedHandler 返回永久 ErrInvalidPayload）都落在第一条上，因此它们不会白白
 // 重试到次数耗尽（需求文档 §4.2）。
-func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error) {
+func (w *Worker) fail(ctx context.Context, task ClaimedTask, cause error, elapsed time.Duration) {
 	summary := cause.Error()
 
 	// Attempt 是"包含本次"的尝试次数，因此 Attempt >= MaxAttempts 即已耗尽。
 	if IsPermanent(cause) || task.Attempt >= task.MaxAttempts {
-		w.markDead(ctx, task, summary)
+		w.markDead(ctx, task, cause, elapsed)
 		return
 	}
 
-	if err := w.store.Retry(ctx, task, w.retryDelay(task.Attempt), summary); err != nil {
-		w.report(fmt.Errorf("retry task %d: %w", task.ID, err))
+	delay := w.retryDelay(task.Attempt)
+	if err := w.store.Retry(ctx, task, delay, summary); err != nil {
+		w.report(ctx, fmt.Errorf("retry task %d: %w", task.ID, err))
+		return
 	}
+	w.logf(ctx, LevelWarn, "task failed; retry scheduled",
+		append(w.taskLogFields(task), "delay", delay, logKeyError, cause)...)
 }
 
 // markDead 把任务写回死信终态。写回失败通常是租约丢失，只上报。
-func (w *Worker) markDead(ctx context.Context, task ClaimedTask, summary string) {
-	if err := w.store.MarkDead(ctx, task, summary); err != nil {
-		w.report(fmt.Errorf("mark task %d dead: %w", task.ID, err))
+//
+// 只在写回真的落地后记日志：MarkDead 被 fencing 拒掉时任务并没有进死信，
+// 此时记一条"已死信"会让日志与库里的状态互相矛盾。
+func (w *Worker) markDead(ctx context.Context, task ClaimedTask, cause error, elapsed time.Duration) {
+	if err := w.store.MarkDead(ctx, task, cause.Error()); err != nil {
+		w.report(ctx, fmt.Errorf("mark task %d dead: %w", task.ID, err))
+		return
 	}
+	w.logf(ctx, LevelWarn, "task marked dead",
+		append(w.taskLogFields(task), "duration", elapsed, logKeyError, cause)...)
 }
 
 // retryBackoffCap 返回第 attempt 次尝试失败后、下一次重试延迟的上界：
@@ -867,10 +932,42 @@ func (w *Worker) sleep(ctx context.Context, backoff time.Duration) time.Duration
 	return next
 }
 
-// report 上报一个与单个任务无关的基础设施错误。
-func (w *Worker) report(err error) {
+// report 上报一个与单个任务无关的基础设施错误，或一条任务被放弃的异常结果。
+//
+// 两个出口同时走：onError 是本包测试用的观察缝隙，日志才是给部署方的。日志一律
+// 用**脱离取消**的 context——report 报的都是"已经发生的事实"，不该因为 ctx 恰好
+// 被取消而丢掉（停机路径上报的批次遗留、写回失败都属于这一类）。
+func (w *Worker) report(ctx context.Context, err error) {
 	if w.onError != nil {
 		w.onError(err)
+	}
+	w.logf(context.WithoutCancel(ctx), LevelError, "worker error",
+		logKeyWorkerID, w.owner, logKeyError, err)
+}
+
+// logf 记一条结构化日志。未配置 Logger 时静默——"要不要日志"是部署决定，
+// 不是配置错误，因此 nil 检查集中在这一处，调用点不必各自判空。
+func (w *Worker) logf(ctx context.Context, level Level, msg string, kv ...any) {
+	if w.cfg.Logger == nil {
+		return
+	}
+	w.cfg.Logger.Log(ctx, level, msg, kv...)
+}
+
+// taskLogFields 返回一条任务的公共日志字段。
+//
+// 字段名是稳定的 snake_case，与需求 §8 列出的名字一一对应（task_id / task_type /
+// queue / attempt / lease_epoch / worker_id，另加 max_attempts 便于判断是否已是
+// 最后一次机会），便于接入方建索引或写告警查询。**刻意不含 payload**。
+func (w *Worker) taskLogFields(task ClaimedTask) []any {
+	return []any{
+		logKeyTaskID, uint64(task.ID),
+		logKeyTaskType, task.Type,
+		logKeyQueue, task.Queue,
+		logKeyAttempt, task.Attempt,
+		logKeyMaxAttempts, task.MaxAttempts,
+		logKeyLeaseEpoch, task.Epoch,
+		logKeyWorkerID, w.owner,
 	}
 }
 
