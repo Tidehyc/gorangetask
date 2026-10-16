@@ -60,6 +60,11 @@ type fakeStore struct {
 	// onSucceed 在成功确认后被调用（用于测试里等待异步处理完成）。
 	onSucceed func(TaskID)
 
+	// onSucceedEntered 在 Succeed 进入之后、检查 ctx 之前被调用。它让用例能把
+	// 停机卡在**这次写回的正中间**——"进入 ack 时 ctx 还活着、DB 往返途中才被取消"
+	// 那个窗口就是靠它确定性复现的（onSucceed 做不到：它在这之后才触发）。
+	onSucceedEntered func()
+
 	// renewFn 决定第 call 次（从 1 开始）续租的返回；为 nil 时一律成功。
 	// 用例用它来制造失租、数据库错误，或把"已经续够了"当作同步点。它拿到的是
 	// 这次续租自己的 ctx，因此也能模拟"语句执行到一半被取消"的真驱动行为。
@@ -106,6 +111,14 @@ func (f *fakeStore) Claim(_ context.Context, spec ClaimSpec) ([]ClaimedTask, err
 
 func (f *fakeStore) Succeed(ctx context.Context, task ClaimedTask) error {
 	f.noteWriteBack()
+
+	f.mu.Lock()
+	entered := f.onSucceedEntered
+	f.mu.Unlock()
+	if entered != nil {
+		entered()
+	}
+
 	if err := f.ctxErr(ctx); err != nil {
 		return err
 	}
@@ -1356,6 +1369,66 @@ func TestWorkerShutdownAcksHandlerThatFinishedInTime(t *testing.T) {
 
 	if got := store.succeededIDs(); len(got) != 1 || got[0] != 47 {
 		t.Errorf("succeeded = %v, want [47]: a handler that completed must still be acked", got)
+	}
+}
+
+// TestWorkerAcksSuccessEvenIfShutdownStartsMidAck 覆盖一个很窄但真实的窗口：
+// Handler 已经成功返回、进入 ack 时停机**还没**开始，停机恰好在这一次写回往返
+// 的中间发生。
+//
+// 上面那条用例只覆盖了"进入 ack 时 ctx 已经取消"，因此 ack 里原先那句"仅在
+// ctx.Err() != nil 时才换用脱离取消的 context"看起来是对的——它漏掉的正是这个
+// 窗口：那时拿到的还是活的 ctx，取消一进来，这次写回就失败了，一个本来成功的任务
+// 白跑一遍。这个缺陷是 2026-10-16 由示例的端到端用例实测撞出来的
+// （`ack success for task 2: succeed task: context canceled`），随机复现率约 1/8。
+func TestWorkerAcksSuccessEvenIfShutdownStartsMidAck(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	store := &fakeStore{
+		batches:   [][]ClaimedTask{{claimedTask(61, "t", 1, 3)}},
+		honourCtx: true,
+		onSucceedEntered: func() {
+			close(entered)
+			<-release // 卡在写回正中间，等用例把 ctx 取消掉
+		},
+	}
+
+	reg := NewRegistry()
+	// Handler 立刻成功返回，好让 ack 紧接着发生。
+	if err := reg.Register("t", func(context.Context, json.RawMessage) error { return nil }); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	w, err := NewWorker(store, reg, fastConfig())
+	if err != nil {
+		t.Fatalf("NewWorker() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Succeed was never called")
+	}
+	cancel()       // 此刻 Succeed 已经在往返途中，ackCtx 早已确定
+	close(release) // 放它继续，让它去检查 ctx
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after shutdown")
+	}
+
+	if got := store.succeededIDs(); len(got) != 1 || got[0] != 61 {
+		t.Errorf("succeeded = %v, want [61]: an already-finished handler must still be acked "+
+			"even when shutdown lands in the middle of the ack round trip", got)
 	}
 }
 

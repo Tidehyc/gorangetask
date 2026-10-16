@@ -172,11 +172,17 @@ type WorkerStore interface {
 //   - 领取：一次 claim 周期内先提交事务，再执行 Handler，顺序有保证。
 //   - 并发：Run 按 Config.Concurrency 起同等数量的 goroutine，各自独立领取。
 //   - 成功：写回 succeeded 终态。
-//   - 失败：写回 pending 立即重试；若尝试次数已耗尽则写为 dead。
+//   - 失败分流（§4「重试退避与永久错误」）：永久失败（IsPermanent，如未知任务类型、
+//     payload 无法解码）直接写 dead，不做无谓重试；其余失败按**有上限的指数退避 +
+//     抖动**写回 pending，尝试次数耗尽后写 dead。
+//   - 单任务 panic 兜底（§4「panic 处理」）：Handler panic 被收成一次普通失败，
+//     只终结这一条任务。
 //   - 优雅停机（§3「Worker graceful shutdown」）：见 Run 的说明。
 //   - 租约续期与失租取消（§4「租约续期」「lease 丢失取消 context」）：见下方
 //     「本次执行的三条取消路径」。
 //   - 过期租约回收（§4「过期租约回收」）：见下方「过期租约回收器」。
+//   - 终态清理（§4「终态清理」）：Run 还起一个清理协程，按保留期删除
+//     succeeded / canceled / dead 三类终态任务，避免任务表随吞吐无限增长。
 //
 // # 本次执行的三条取消路径
 //
@@ -210,10 +216,6 @@ type WorkerStore interface {
 // （见 WorkerStore.ReapExpiredLeases）。
 //
 // 尚未实现的语义（后续工作项，文档已排期）：
-//   - **指数退避与永久错误（§4）**：失败一律立即重试，不区分 Permanent，
-//     也不做退避；因此永久失败的任务会尝试到次数耗尽才进入 dead。
-//   - **panic 隔离（§4）**：Handler panic 会向上冒泡，尚未被单任务边界拦截。
-//   - **终态清理（§4）**：succeeded / dead / canceled 目前不会被删除。
 //   - **可观测性（§5）**：基础设施错误目前没有公开出口，只能通过内部 onError 观察；
 //     ReapResult 的两个计数也还没有消费方。
 type Worker struct {
@@ -668,16 +670,23 @@ func (w *Worker) cleanupSpecs() []CleanupSpec {
 
 // ack 把一条执行成功的任务写回 succeeded 终态。
 //
-// 正常运行时直接用 ctx。停机期间 ctx 已被取消，此时换用一个脱离该取消、
-// 只保留 Config.ShutdownTimeout 作为预算的 context——否则这条已经成功的
-// 结果会因为停机取消写不回去，白白多执行一次。
+// 这次写回**总是**脱离 ctx 的取消，只保留 Config.ShutdownTimeout 作为预算。
+// 理由有三条：
+//
+//  1. 一条已经结束的执行，确认下来不会造成并行执行，还能省掉一次重复，所以它值得
+//     一个不受停机影响的预算；
+//  2. **只在"进来时 ctx 已取消"时才脱离是不够的**——还有一个更窄的窗口：进来时
+//     停机尚未开始、DB 往返途中才被取消。那种情况下用 ctx 会让这次写回直接失败，
+//     于是一个本来成功的任务白跑一遍。这个窗口 2026-10-16 由示例的端到端用例实测
+//     抓到（`ack success for task N: succeed task: context canceled`），见
+//     TestWorkerAcksSuccessEvenIfShutdownStartsMidAck；
+//  3. 顺带把"数据库卡住"的边界也收紧成有界等待，与续租的做法一致（见 watchLease）。
+//
+// 失租时不写回，由调用方（process）在进入本函数之前判掉。
 func (w *Worker) ack(ctx context.Context, task ClaimedTask) {
-	ackCtx := ctx
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ackCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), w.cfg.ShutdownTimeout)
-		defer cancel()
-	}
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.cfg.ShutdownTimeout)
+	defer cancel()
+
 	if err := w.store.Succeed(ackCtx, task); err != nil {
 		// 写回失败通常是租约过期/易主（ErrLeaseLost）。按设计不做无条件更新补救，
 		// 任务的最终命运交给回收器。
