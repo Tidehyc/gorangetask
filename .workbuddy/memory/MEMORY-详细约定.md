@@ -398,3 +398,39 @@ DB 往返途中 ctx 被取消 ⇒ 成功结果写不回去。直接违背 `ack` 
   `TestWorkerShutdownAcksHandlerThatFinishedInTime`（只覆盖"进来时 ctx 已取消"）仍通过
   ⇒ 证明新用例覆盖的是一处真空白，不是重复。
 - 修复后 `TestExampleWorkerExportsOrders` 用 `-cover` 连跑 60 次 0 失败。
+
+## 故障演示（README「停机打断 → 租约过期 → 换人接手」）
+
+**为什么给示例加开关**：默认 `LeaseDuration 30s` / `ReapInterval 30s`，这条路径要走几十秒，
+写进文档没法让人照着秒级复现。于是 `cmd/demo` 增加 `-lease` / `-reap`，并把映射抽成纯函数
+`workerConfig(lease, reap) gorangetask.Config` 以便单测。
+
+**踩到的不变量**：库的 `Validate` 要求 `HeartbeatInterval < LeaseDuration`，而默认心跳写死 10s。
+只覆盖 `LeaseDuration`、把心跳留给库默认 ⇒ `-lease 5s` 时 `NewWorker` 当场报
+`heartbeat interval (10s) must be < lease duration (5s)`，第一步命令直接废。
+修法：租约被覆盖时心跳按同样的 1/3 一并推导。
+⇒ 一般形态：**一个「只改 A」的旋钮，可能因 A 与 B 之间有不变量而必须连 B 一起改；找法是读
+`Validate`，而不是只看被改的那个字段。**
+
+**零值用例的写法**：`TestWorkerConfigLeavesDefaultsAloneWhenUnset` 只断言三个字段都为 0，
+**不引用 `gorangetask.DefaultLeaseDuration` 之类的库常量**——引用常量等于「实现等于它自己」，
+库日后改默认值时测试照样绿，是空断言。另外 `Config` 含 `Queues []string`、不可比较，
+所以只能逐字段断言（不能用 `cfg != gorangetask.Config{}`）。
+
+**三条证伪（全部成立）**：① 去掉心跳推导 ⇒ 报上面那条校验错（报错原文与预期一字不差）；
+② `reap != 0` 改成 `reap > 0` ⇒ 负值透传用例失败（`ReapInterval` 变 0 而不是 `-1`）；
+③ 给 `workerConfig` 抄死库默认值 ⇒ 零值用例失败。全部还原后与备份逐字节一致（md5 相同）。
+
+**实测复现**：第一幕 `-orders 2 -handler-delay 30s -lease 5s -reap 2s`，12 秒后 SIGINT ⇒
+业务行 `pending`、任务行 `running`、`attempt 1`、`lease_until` 比 `now_utc` 晚约 5 秒；
+再等 6 秒查库 ⇒ `lease_until` 已过去但**状态仍是 `running`**；第二幕 `-orders 0 -lease 5s
+-reap 2s` ⇒ 约 2 秒（一个回收周期）后回收器放回 `pending`、同一 Worker 领取跑完，
+收尾 `succeeded / attempt 2`。
+
+**两个观测要点**：
+1. **租约到期本身不改变任何东西**——没有活着的 Worker 在跑回收器，过期租约只会一直停在
+   `running`。这是「回收只在 Worker 进程内跑」这条边界的可观测形态，文档要这么写。
+2. **别把业务表状态当任务状态读**。`-orders 0` 模式打印的是 `printOrders` 的业务表，
+   `pending` 意为「业务行还没被写回」，与任务在不在排队无关。我曾据此误以为「1 秒时已
+   `pending`」与「回收器 2 秒才跑第一趟」矛盾，查证后确认是两列不同的东西。
+   判定「同一条任务被领过两次」要看 **`attempt` 从 1 变 2**，那才是直接证据。
