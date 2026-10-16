@@ -393,6 +393,14 @@ Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至
 
 期望结果：前两种情况下任务最终可恢复，副作用可能重复但幂等；最后一种情况下旧 Worker 状态写回被 fencing 条件拒绝。
 
+**实现口径（2026-10-16，示例落地后回填）**：示例 `example/basic` 只提供一个故障开关 `Options.HandlerDelay`——Handler 在写回之前先等这么久，用 `timer + select{<-timer.C, <-ctx.Done()}` 实现（停机时必须能立刻收手，用 `time.Sleep` 会让 Worker 白等满 `ShutdownTimeout`）。三个时点各自的落地方式：
+
+- **claim commit 后、Handler 开始前**：不需要开关。把 `ShutdownTimeout` 设得小于 Handler 耗时即可——停机超时后 `Run` 返回 `ErrShutdownTimeout`，在途任务保持 `running`。已由 `TestWorkerReapsTaskAbandonedByShutdown` 覆盖。
+- **副作用完成后、成功写回前**：由"Handler 在副作用之后返回一个普通错误"制造，而不是真的 kill 进程。两者在库侧**完全等价**：库对"没拿到成功写回"只有一条处理路径（按失败重试），它并不区分 Handler 是返回了错误、panic 了还是进程没了。已由 `TestExampleExportSideEffectHappensOnceAcrossAFailedAck` 覆盖（断言业务时间戳在重试前后不变）。
+- **旧 Worker 复苏后尝试写回**：仍待补。机制侧已有等价证据（§6 fencing 的三条写回拒绝），缺的是"让一个旧 Worker 延迟苏醒再真的尝试写回"的端到端场景。
+
+刻意**不**加"在某处直接 kill 进程"的钩子：那会把进程控制塞进库或示例的公开面，代价大于收益；上面第一条已经真实地产生了"进程没了"的效果——回收器接手那条链路是真的走了一遍。
+
 ### 8.3 性能基准
 
 记录 MySQL 版本/资源、连接池、payload 大小、Worker 数、任务耗时和配置，报告：入队 p50/p95/p99、提交到开始延迟、tasks/s、积压排空时间、claim SQL `EXPLAIN`、锁等待、连接池占用和空队列轮询 QPS。吞吐目标先不拍脑袋设定；首轮建立可复现基线，再以功能正确为先优化。
