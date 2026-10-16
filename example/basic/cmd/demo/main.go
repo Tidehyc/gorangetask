@@ -4,6 +4,8 @@
 //	go run ./example/basic/cmd/demo
 //	go run ./example/basic/cmd/demo -orders 3 -watch 500ms
 //	go run ./example/basic/cmd/demo -orders 0            # 不建订单，只起 Worker 观察业务表
+//	go run ./example/basic/cmd/demo -orders 2 -handler-delay 30s -lease 5s -reap 2s
+//	                                                     # 故障演示：Ctrl-C 打断在途任务，等租约过期后被接手
 //
 // 连接串从 GOTASK_EXAMPLE_DSN 读，缺省用 scripts/dev-mysql.sh 起的本地容器。
 //
@@ -48,6 +50,8 @@ type options struct {
 	orders       int
 	handlerDelay time.Duration
 	watch        time.Duration
+	lease        time.Duration
+	reap         time.Duration
 }
 
 // trackedOrder 把 demo 关心的两侧 ID 配成一对：业务侧订单与它对应的任务。
@@ -71,6 +75,10 @@ func parseFlags() options {
 	flag.DurationVar(&opts.handlerDelay, "handler-delay", 0,
 		"导出 Handler 在写回前先等待多久（用于演示停机打断在途任务）")
 	flag.DurationVar(&opts.watch, "watch", time.Second, "打印状态的间隔")
+	flag.DurationVar(&opts.lease, "lease", 0,
+		"任务租约时长；不设置用库默认 30s。调小它能让「租约过期后换人接手」几秒内发生（心跳按租约的 1/3 一起推导）")
+	flag.DurationVar(&opts.reap, "reap", 0,
+		"过期租约回收器的运行间隔；不设置用库默认 30s，负数关闭回收器")
 	flag.Parse()
 
 	if opts.dsn == "" {
@@ -82,6 +90,26 @@ func parseFlags() options {
 	return opts
 }
 
+// workerConfig 把演示用的两个旋钮翻译成库的 Worker 配置。
+//
+// 故障演示要把「租约到期 → 回收器接手」压进几秒，于是允许把 LeaseDuration 调小。
+// 但库要求 HeartbeatInterval < LeaseDuration，而默认心跳是固定的 10s——一旦把租约
+// 调到 10s 以下、又沿用默认心跳，NewWorker 会当场报「心跳必须小于租约」。
+// 所以租约被覆盖时，心跳按同样的 1/3 比例一起推导，守住「心跳是租约的 1/3」这条不变量。
+//
+// 零值配置与"什么都不设"完全等价，因此不传这两个开关时行为一点不变。
+func workerConfig(lease, reap time.Duration) gorangetask.Config {
+	var cfg gorangetask.Config
+	if lease > 0 {
+		cfg.LeaseDuration = lease
+		cfg.HeartbeatInterval = lease / 3
+	}
+	if reap != 0 {
+		cfg.ReapInterval = reap
+	}
+	return cfg
+}
+
 func run() error {
 	opts := parseFlags()
 
@@ -89,7 +117,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	app, err := basic.Open(ctx, opts.dsn, basic.Options{HandlerDelay: opts.handlerDelay})
+	app, err := basic.Open(ctx, opts.dsn, basic.Options{
+		HandlerDelay: opts.handlerDelay,
+		Config:       workerConfig(opts.lease, opts.reap),
+	})
 	if err != nil {
 		return err
 	}
