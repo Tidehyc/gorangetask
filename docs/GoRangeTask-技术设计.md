@@ -331,7 +331,7 @@ API 约定：
 - 幂等冲突**依赖唯一索引**而不是“先查后插”：后者在并发下必然漏判。空幂等键写入 NULL 而非空串——MySQL 唯一索引不约束 NULL，但会把空串当成真实取值，从而把“没有幂等键”误判成“幂等键重复”。
 - `ErrDuplicateTask` 不返回既有任务 ID：调用方若需要旧任务，应自行按幂等键查询（需求文档未要求该能力，故不作为默认行为）。
 - `EnqueueTx` 的 `Tx` 只要求执行 INSERT 所需的方法，不暴露 Commit/Rollback，避免库误操作调用方事务。
-- GORM adapter 暴露独立入口（具体包名待仓库结构确认），接收 `*gorm.DB` 事务并执行同一 INSERT；adapter 通过传入对象执行，不开启新事务。
+- GORM adapter 是可选子包 `adapter/gorm`（包名 `gormadapter`），入口为 `(*Adapter).EnqueueTx(ctx, tx *gorm.DB, task)`，执行与 `EnqueueTx` 完全相同的那条 INSERT。它**不能**把 `*gorm.DB` 直接当作 `Tx`——GORM 没有 `ExecContext`，且它的 `Exec` 会丢掉 `sql.Result`，拿不到新插入行的 ID。实现口径见 §6.2。
 - `Get` 返回任务当前状态的快照，不含 Worker 内部字段（`lease_owner` / `lease_until` / `lease_epoch`）；时间字段一律 UTC；任务不存在返回 `ErrNotFound`。
 - `Cancel` 只成功取消当前 `pending` 任务。任务不存在返回 `ErrNotFound`；已领取（`running`）或已处于终态（`succeeded` / `dead` / `canceled`）返回 `ErrNotPending`，错误信息里带上实际状态，便于从日志直接看出原因。重复取消同一个任务因此也返回 `ErrNotPending`（`canceled` 是终态）。
 - 状态判断不提供更强的“结果”抽象：`Cancel` 只返回错误，不回传被取消任务的快照。调用方需要详情时再调 `Get`。
@@ -339,6 +339,75 @@ API 约定：
 - Worker 启动时校验所监听队列和 Handler 注册；未知 task type 的任务进入永久失败路径，避免快速无限重试。
 
 Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至 2 秒并加抖动）、batch size 1、lease duration 30 秒、heartbeat 10 秒、shutdown timeout 30 秒。所有配置可覆盖；这些默认值是起步值，压测后再调整。
+
+### 6.1 可观测性（2026-10-16 落地）
+
+两件事刻意分开：**日志面向人**（带 task ID 与错误原文，用来追溯"这一条任务发生了什么"），**指标面向聚合**（不带任何高基数维度）。把它们混成一个接口，是监控系统基数爆掉的常见开端。
+
+日志是 `Config.Logger`：
+
+```go
+type Level int // LevelDebug / LevelInfo / LevelWarn / LevelError
+
+type Logger interface {
+	Log(ctx context.Context, level Level, msg string, kv ...any)
+}
+```
+
+- 只有一个方法、一条消息加一串键值对，**不绑定任何日志库**（接 `log/slog` 是十几行适配）。
+- `nil` 是合法且默认的取值——要不要日志、往哪写是部署决定，不是配置错误。因此 `WithDefaults` 不填它、`Validate` 也不校验它。
+- 字段名是稳定契约，与需求 §8 对齐：`task_id` / `task_type` / `queue` / `attempt` / `max_attempts` / `lease_epoch` / `worker_id`，另有 `duration` / `delay` / `error`。**payload 永不写入日志**（有一条用哨兵值守的用例）。
+- 内部缝隙 `onError` 保留为**测试用观察点**（12 处既有用例依赖它），不是公开出口。
+
+指标是 `Config.Metrics`（Worker 侧）与 `ClientConfig.Metrics`（入队与取消）：
+
+```go
+type Metrics interface {
+	TaskEnqueued(queue string)
+	TaskCanceled()
+	TaskClaimed(queue, taskType string)
+	TaskFinished(queue, taskType string, outcome Outcome, d time.Duration)
+	TaskWaited(queue, taskType string, d time.Duration)
+	LeaseLost(queue, taskType string)
+	HandlerPanicked(queue, taskType string)
+	HandlerTimedOut(queue, taskType string)
+	TasksReaped(toPending, toDead int)
+	TasksCleaned(status Status, deleted int64)
+	ClaimLatency(d time.Duration)
+	ConcurrencyInUse(n int)
+}
+```
+
+- **具名事件，不是通用的 `Counter(name, labels)` 原语**：指标名与标签集合由库固定，接入方无法（也无法不小心）把 task ID 这类高基数维度塞进标签——需求 §8 明确禁止这件事，而通用原语恰好把犯错的机会留给每一个使用方。接 Prometheus 时嵌入 `NopMetrics`、只覆盖关心的事件即可。
+- `nil` 在构造期（`NewWorker` / `mysqlstore.New`）被替换成 `NopMetrics`：打点散布在库内部十来处，让每个调用点各自判空既啰嗦又容易漏，而漏一处就是 nil 解引用 panic。
+- **两条需求条目刻意不做**：按队列与状态的积压量（要库主动轮询，改由宿主查 `SELECT queue_name, status, COUNT(*) FROM gotask_tasks GROUP BY 1, 2`）、数据库连接池占用（属于宿主，用 `db.Stats()`）。
+- **排队延迟由存储层算好带出来**：`ClaimedTask.Wait` 来自
+  `TIMESTAMPDIFF(MICROSECOND, GREATEST(created_at, run_at), UTC_TIMESTAMP(6))`，即"从最早可被领取到实际被领取"。取 `GREATEST` 而不是 `created_at`——延迟任务在 `run_at` 之前本就不该被领取，把它刻意安排的等待算进"排队延迟"会污染这个指标；用数据库时钟而不是 Worker 本地时钟，理由与 §3.2 同。
+- `TaskFinished` 只在写回**真的落地之后**记：被 fencing 拒绝时任务并没有成功、也没有进死信，记了会让观测数据与库里的状态互相矛盾。回收与清理同理，只在真有动作时上报——它们每轮都在跑，零值也上报会把"确实捡回了任务"那一次埋在噪音里。
+- **已知局限**：`TaskEnqueued` 在 `EnqueueTx` 上也会计数，**包括事务最终回滚的那一次**——库无从知道调用方的事务是否提交（`Tx` 刻意不暴露 Commit）。这条写进了接口注释，也在集成测试里做成显式断言，而不是含糊带过。
+
+### 6.2 GORM adapter 的执行口径（2026-10-16 落地）
+
+`*gorm.DB` 满足不了 `Tx`，两条都是读 gorm v1.31.2 源码确认的：
+
+1. 它**没有** `ExecContext`——执行入口是 `Exec(sql string, values ...interface{}) *DB`，返回的是链式句柄，错误与结果都藏在会话状态里。
+2. 它的 `Exec` **丢弃 `sql.Result`**。整个 gorm v1.31.2 里只有 `callbacks/create.go:142` 读过 `LastInsertId`，那是 `Create` 流程内部的事；裸 SQL 走 `Exec` 拿不到新插入行的 ID，而 `EnqueueTx` 必须返回任务 ID。
+
+因此 adapter 不碰 GORM 的执行入口，而是取出 **GORM 正在使用的连接**（gorm 定义的 `ConnPool` 接口）：
+
+```go
+tx.Statement.ConnPool
+```
+
+`gorm.Open` 之后它是 `*sql.DB`（autocommit）；`db.Begin()` / `db.Transaction` 之后它被替换成 `*sql.Tx`（开启 `PrepareStmt` 时是 gorm 的 `*PreparedStmtTX` 包装）。adapter 把它交给 `store/mysql.EnqueueTx`，于是校验、幂等键冲突识别、时间口径与普通入队**逐字复用**，没有第二份 INSERT。
+
+三条设计要点：
+
+- **编译期断言** `var _ gorangetask.Tx = gormio.ConnPool(nil)`：ConnPool 的 `ExecContext` 与 `Tx` 的签名一致（ctx、查询、变参、`(sql.Result, error)`）。GORM 哪天改了它，这里是**编译失败**，而不是运行期把任务写进错误的连接。
+- **拒绝非事务句柄**，判据取"**是不是 `*sql.DB`**"而**不是**"是不是 `*sql.Tx`"：`PrepareStmt` 模式下事务里的连接池是 gorm 自己的 `*PreparedStmtTX`，并不是 `*sql.Tx`，那种正当用法不能被误伤。这是最需要挡的误用——非事务的 `*gorm.DB` 会让任务行走自己的连接，与业务写入不在同一个事务里，而它编译通过、运行也不报错，**只在回滚时暴露**（业务行没了、任务行还在）。
+- **包名 `gormadapter` 与目录名 `adapter/gorm` 不同**：使用方几乎总要同时 import `gorm.io/gorm`，包名若也叫 gorm 就得处处起别名。
+
+验证的判别点在**回滚**而不是提交：把 adapter 换成非事务入队后，"提交则两行都可见"的正向用例**照常通过**，只有回滚用例报出 `task rows = 1 after rollback`（见 §8.2）。
 
 ## 7. 项目包结构
 
@@ -350,23 +419,25 @@ Worker 默认配置：并发 4、poll interval 250 ms（空闲时指数退避至
 ├── errors.go             # 公开可判断错误
 ├── handler.go            # Handler 类型与 Registry 注册表
 ├── config.go             # Worker 与 Client 配置、默认值与校验
-├── worker.go             # Worker 生命周期、并发和 shutdown
-├── store/                # MySQL store：Client（入队/查询）、claim/lease/retry/reaper SQL
+├── observability.go      # Logger / Level 与 Metrics / Outcome / NopMetrics
+├── worker.go             # Worker 生命周期、并发、回收、清理与 shutdown
+├── store/                # MySQL store：Client（入队/查询）、claim/lease/retry/reaper/cleanup SQL
 │   └── mysql/            # 方言实现（package mysql，导入路径 .../store/mysql）
 ├── migrations/mysql/     # 版本化 DDL + runner（package mysqlmigrations，独立包）
-├── adapter/gorm/         # 可选官方 GORM adapter
-├── example/basic/        # 业务事务 + EnqueueTx + Handler 示例
-├── integration/          # 真 MySQL 测试
-└── docs/                 # API、语义、运维与基准说明
+├── adapter/gorm/         # 可选官方 GORM adapter（package gormadapter）
+├── example/basic/        # 业务事务 + EnqueueTx + Handler 示例（含 cmd/demo 入口）
+└── docs/                 # 需求、技术设计、迁移机制、进度跟踪与 STAR 说明
 ```
+
+> **2026-10-16 修正**：上面这份目录树原先还列了一个 `integration/`，但那个目录**从未建过**——真库测试一直与各自包放在同一目录（`store/mysql`、`migrations/mysql`、`adapter/gorm`、`example/basic` 各有自己的 `*_integration_test.go`），用 DSN 环境变量开关、不设就跳过。各包另有独立的派生库名以避免并发跑包时互相删表。同时补上后加的 `observability.go` 与 `cmd/demo`。目录只在有真实内容时创建，这一条仍然守着。
 
 结构决策（2026-10-11 确认）：
 
 - **根包 `gorangetask` 保留公开契约**：`Task`/`TaskInfo`/`Status`/`Handler`/`Registry`/`Client`/`Tx`/配置/错误。使用者的导入面只有根包，语义一目了然。
 - **`store/` 承载 SQL 与方言**：领取、续租、成功/失败确认、回收、清理等所有语句实现放在 `store/`（MySQL 方言在 `store/mysql`）。根包通过接口依赖 store，不直接写 SQL。
 - **`migrations/mysql` 保持独立包，不并入 `store/mysql`**（2026-10-12 确认）：迁移 DDL 用 `//go:embed` 打包，而 `embed` 不能跨目录向上取文件，若并入 store 就必须把 .sql 搬进 `store/mysql` 目录下。迁移是“建表”这件事的完整闭环（DDL + 版本管理 + runner + 注释剥离），自成一体、已有独立测试；store 只读表、不建表，两者职责不重叠。因此调用方分两步用：先 `mysqlmigrations.Migrate`，再 `mysqlstore.New`。
-- **可选依赖隔离在子包**：GORM adapter 放 `adapter/gorm`，只有使用 GORM 的应用才引入；`migrations` 通过 `embed` 打包，避免运行时依赖外部文件路径。
-- **首版不必一次性建满**：根包在 API 类型阶段已经成形；`config.go`/`worker.go`/`store/` 随对应实现阶段加入，`example`/`integration`/`adapter` 在验证与适配阶段加入。目录只在有真实内容时创建，不提交空占位目录。
+- **可选依赖隔离在子包**（2026-10-16 补实情）：GORM adapter 放 `adapter/gorm`，核心包不 import 它，因此不使用 GORM 的项目不会把它编译进产物。但它与核心在**同一个 module** 里，所以 `go.mod` 会列出 `gorm.io/gorm` 与 `gorm.io/driver/mysql`——Go 的模块图是全仓库共享的，这一点无法靠"放在子包"绕开（要彻底隔离就得给 adapter 单开一个 module 并单独打 tag，代价与收益不成比例）。它与 §1 的"核心不依赖 GORM"并不矛盾：那条说的是 **import** 层面的隔离。`migrations` 通过 `embed` 打包，避免运行时依赖外部文件路径。
+- **首版不必一次性建满**：根包在 API 类型阶段已经成形；`config.go`/`worker.go`/`store/` 随对应实现阶段加入，`example`/`adapter` 在验证与适配阶段加入（原计划里写着 `integration`，实际没建——真库测试与各自包同目录，见上方 2026-10-16 修正）。目录只在有真实内容时创建，不提交空占位目录。
 
 ## 8. 验证计划
 

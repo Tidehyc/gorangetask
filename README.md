@@ -4,9 +4,9 @@ GoRangeTask 是一个可嵌入 Go 服务的 **MySQL 持久化任务队列**，�
 
 > **项目状态：早期开发中。**
 >
-> **已可用**：任务与配置类型、Handler 注册表与 payload 解码、公开错误、MySQL migration（版本管理 + 脏状态检测）、完整的 MySQL Client（`Enqueue` / `EnqueueTx` / `Get` / `Cancel`，含幂等键），以及 Worker 侧的领取与执行闭环（`Claim` / `Succeed` / `Retry` / `MarkDead`、并发 `Run` 轮询、**租约续期与失租取消**、**过期租约回收**、**失败退避与永久错误分流**、**Handler panic 兜底**、**终态任务清理**、优雅停机、逐任务超时）。单元测试与真库集成测试覆盖上述实现，CI 已接入 MySQL。另有一个**可独立运行的示例服务** `example/basic`（业务行与任务行同事务创建、幂等 Handler、`cmd/demo` 入口），见下文「安装与快速开始」。
+> **已可用**：任务与配置类型、Handler 注册表与 payload 解码、公开错误、MySQL migration（版本管理 + 脏状态检测）、完整的 MySQL Client（`Enqueue` / `EnqueueTx` / `Get` / `Cancel`，含幂等键），以及 Worker 侧的领取与执行闭环（`Claim` / `Succeed` / `Retry` / `MarkDead`、并发 `Run` 轮询、**租约续期与失租取消**、**过期租约回收**、**失败退避与永久错误分流**、**Handler panic 兜底**、**终态任务清理**、优雅停机、逐任务超时）。单元测试与真库集成测试覆盖上述实现，CI 已接入 MySQL。另有一个**可独立运行的示例服务** `example/basic`（业务行与任务行同事务创建、幂等 Handler、`cmd/demo` 入口），见下文「安装与快速开始」。**结构化日志**（`Config.Logger`）与**指标**（`Config.Metrics` / `ClientConfig.Metrics`）已接上，见下文「可观测性」；官方可选 **GORM adapter** 见下文「在 GORM 事务里入队」。
 >
-> **尚未实现**：结构化日志与指标、GORM adapter。
+> **尚未实现**：性能基线——吞吐、排队延迟与数据库成本还没有在目标负载下实测，因此 STAR 里的数字一个都还不能填（进度跟踪 §6）。另外 §6 的「旧 worker 复苏」端到端故障注入也还没做；机制侧已有等价证据——陈旧 owner/epoch 与已过期租约都直接验证过写入被 `ErrLeaseLost` 拒绝且库里零痕迹。
 >
 > **已知边界**：清理是**物理删除**。任务行被删掉之后它的幂等键就不再占用唯一索引，同一个键可以被重新接受——库保证的是"保留期内不重复入队"，不是"永不重复"。需要更强语义时要在业务侧自行去重。终态清理的保留期默认 7 天（`succeeded` / `canceled`）与 30 天（`dead`）；把 `CleanupInterval` 设成负值会关闭清理器，终态表将随任务吞吐单调增长。
 >
@@ -38,9 +38,9 @@ GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策
 - **不替代 RabbitMQ。** 需要跨服务/跨语言分发、广播、路由、Broker 缓冲或多个独立订阅者时，继续使用 Outbox + RabbitMQ 等事件架构。GoRangeTask 不充当 Outbox 转发器。
 - **不追求默认高于 Broker 的吞吐。** MySQL 查询、锁等待、连接池和轮询成本需要在目标负载下实测。
 
-## MVP 目标能力
+## 能力清单
 
-以下是目标功能，尚未全部实现：
+以下每一条都已实现（逐项的实现口径与测试证据见[进度跟踪](docs/GoRangeTask-进度跟踪.md)）：
 
 - `EnqueueTx`：在调用方现有数据库事务中写入任务，不接管事务的提交或回滚。
 - 立即执行和延迟执行。
@@ -50,7 +50,10 @@ GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策
 - 可配置重试次数、有上限的指数退避 + 抖动、永久失败和死信。
 - 可选幂等键、任务状态查询、取消尚未领取的任务。
 - 优雅停机、结构化日志、基础指标和终态任务清理。
+- 官方可选 GORM adapter（`adapter/gorm`）。
 - 可独立运行的示例，演示事务入队、Worker 执行和故障恢复。
+
+尚未验证的是**性能**：吞吐、排队延迟与数据库成本还没在目标负载下实测，因此也还不能给出任何数字。
 
 ## 技术基线
 
@@ -61,7 +64,7 @@ GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策
 | Go module | `github.com/Tidehyc/gorangetask` |
 | Go 版本 | 1.24+ |
 | 数据库 | MySQL 8.0+ / InnoDB；MVP 只验证 MySQL |
-| SQL 层 | 核心包使用 `database/sql`，不依赖 GORM；GORM adapter 为可选组件 |
+| SQL 层 | 核心包使用 `database/sql`，不依赖 GORM；GORM adapter 是可选子包 `adapter/gorm`（已实现） |
 | 许可证 | MIT |
 
 数据库任务表承担本地任务持久化与 Worker 领取，不经过 RabbitMQ。未来支持其他数据库时，需要单独实现并验证该数据库的 migration、领取 SQL、租约 SQL 和并发语义。
@@ -86,7 +89,9 @@ GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策
 go get github.com/Tidehyc/gorangetask
 ```
 
-核心包只用标准库的 `database/sql`，唯一的直接依赖是 MySQL 驱动（由使用方自己引入并注册）。最低 Go 1.24。
+核心包（根包与 `store/mysql`）只用标准库的 `database/sql`，唯一的直接依赖是 MySQL 驱动（由使用方自己引入并注册）。最低 Go 1.24。
+
+仓库里还有一个**可选**子包 `adapter/gorm`，它依赖 `gorm.io/gorm`。核心包不 import 它，因此不使用 GORM 的项目不会把它编译进产物；但 `go.mod` 里会列出这个依赖——Go 的模块图是全仓库共享的。这与"核心不依赖 GORM"并不矛盾：那条说的是 **import** 层面的隔离。
 
 接入的步骤顺序不能换：
 
@@ -289,6 +294,137 @@ id  status     attempt  lease_until  now_utc
 
 > 两个开关只服务于演示。默认是 `LeaseDuration 30s` / `ReapInterval 30s`，照默认跑这条路径要等几十秒；
 > 生产里这个量级才合理——租约太短，一次 GC 停顿或网络抖动就会被误判成"进程崩了"。
+
+## 可观测性：结构化日志与指标
+
+两者都是**可选**的：不配就是静默，库不替你决定往哪写。日志在 `Config.Logger`，
+Worker 指标在 `Config.Metrics`，入队与取消的计数在 `ClientConfig.Metrics`。
+
+### 日志：`Config.Logger`
+
+```go
+type Logger interface {
+	Log(ctx context.Context, level gorangetask.Level, msg string, kv ...any)
+}
+```
+
+它只有一个方法，接任何日志库都是十几行。接 `log/slog`：
+
+```go
+type slogAdapter struct{ l *slog.Logger }
+
+func (a slogAdapter) Log(ctx context.Context, level gorangetask.Level, msg string, kv ...any) {
+	var lvl slog.Level
+	switch level {
+	case gorangetask.LevelDebug:
+		lvl = slog.LevelDebug
+	case gorangetask.LevelInfo:
+		lvl = slog.LevelInfo
+	case gorangetask.LevelWarn:
+		lvl = slog.LevelWarn
+	default:
+		lvl = slog.LevelError
+	}
+	a.l.Log(ctx, lvl, msg, kv...)
+}
+
+cfg.Logger = slogAdapter{l: slog.Default()}
+```
+
+字段名是稳定的 snake_case：`task_id` / `task_type` / `queue` / `attempt` / `max_attempts` /
+`lease_epoch` / `worker_id` / `duration` / `delay` / `error`。**payload 永远不进日志**
+（有一条用哨兵值守着这件事的用例）。
+
+级别分配：`info` 启动、停机、任务成功；`warn` 失败待重试、进入死信；`error` 基础设施错误、
+停机超时；`debug` 每轮领取与清理。回收器**只在真的捡回任务时**记一条——它每轮都在跑，
+每轮都记会把"确实有进程崩过"那一次埋在噪音里。
+
+### 指标：`Config.Metrics` / `ClientConfig.Metrics`
+
+```go
+type Metrics interface {
+	TaskEnqueued(queue string)
+	TaskCanceled()
+	TaskClaimed(queue, taskType string)
+	TaskFinished(queue, taskType string, outcome gorangetask.Outcome, d time.Duration)
+	TaskWaited(queue, taskType string, d time.Duration)
+	LeaseLost(queue, taskType string)
+	HandlerPanicked(queue, taskType string)
+	HandlerTimedOut(queue, taskType string)
+	TasksReaped(toPending, toDead int)
+	TasksCleaned(status gorangetask.Status, deleted int64)
+	ClaimLatency(d time.Duration)
+	ConcurrencyInUse(n int)
+}
+```
+
+它刻意是**具名事件**，而不是通用的 `Counter(name, labels)` 原语：指标名与标签集合由库固定，
+你无法（也无法不小心）把 task ID 塞进标签。接 Prometheus 时嵌入 `NopMetrics`、只覆盖关心的
+几个即可：
+
+```go
+type promMetrics struct {
+	gorangetask.NopMetrics // 其余方法自动成为空实现
+	tasks    *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+func (m *promMetrics) TaskFinished(queue, taskType string, outcome gorangetask.Outcome, d time.Duration) {
+	m.tasks.WithLabelValues(queue, taskType, string(outcome)).Inc()
+	m.duration.WithLabelValues(queue, taskType).Observe(d.Seconds())
+}
+```
+
+两条需求条目刻意**不在库里**：按队列与状态的积压量（要库主动轮询，改由宿主自己查
+`SELECT queue_name, status, COUNT(*) FROM gotask_tasks GROUP BY 1, 2`），以及数据库连接池占用
+（属于宿主，用 `db.Stats()`）。
+
+`TaskWaited` 的数值由**数据库时钟**算出（从任务"最早可被领取"到实际被领取），因此不受各机器
+钟差影响。`TaskEnqueued` 有一条已知局限：`EnqueueTx` 也会计数，**包括事务最终回滚的那一次**
+——库无从知道调用方的事务是否提交。
+
+### 两者别混用
+
+日志面向**人**：带 task ID 与错误原文，用来追溯"这一条任务发生了什么"。指标面向**聚合**：
+不带任何高基数维度。把 task ID 加进指标标签会让监控系统的基数爆掉。
+
+## 在 GORM 事务里入队
+
+`adapter/gorm` 是官方可选包，把 `*gorm.DB` 事务接到同一个 `EnqueueTx` 上：
+
+```go
+import (
+	"gorm.io/gorm"
+
+	gormadapter "github.com/Tidehyc/gorangetask/adapter/gorm"
+)
+
+adapter, err := gormadapter.New(client) // client 就是上文那个 *mysqlstore.Client
+if err != nil {
+	return err
+}
+
+err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := tx.Create(&order).Error; err != nil {
+		return err
+	}
+	_, err := adapter.EnqueueTx(ctx, tx, gorangetask.Task{
+		Queue: "orders", Type: "order.export", Payload: payload,
+	})
+	return err
+})
+```
+
+**必须传事务句柄**：`db.Transaction` 的回调参数，或 `db.Begin()` 的返回值。传一个非事务的
+`*gorm.DB` 会让任务行走自己的连接（autocommit），与业务写入不在同一个事务里——那种写法
+编译通过、运行也不报错，只在回滚时才暴露（业务行没了、任务行还在），所以 adapter 会直接
+拒绝它。
+
+为什么不能直接把 `*gorm.DB` 当作 `gorangetask.Tx`：它没有 `ExecContext` 方法，而且它的 `Exec`
+会丢掉 `sql.Result`——GORM 只在内部的 `Create` 流程里读 `LastInsertId`，裸 SQL 拿不到新插入
+行的 ID，而 `EnqueueTx` 必须返回任务 ID。adapter 因此从 `*gorm.DB` 上取出**它正在使用的连接**
+（`Statement.ConnPool`），交给 `store/mysql` 执行与普通入队完全相同的那条 INSERT：校验、
+幂等键冲突识别、时间口径全部复用，没有第二份实现。
 
 ## 文档
 
