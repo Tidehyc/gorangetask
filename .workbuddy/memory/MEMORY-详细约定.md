@@ -337,3 +337,64 @@
   `CleanupInterval: -1`），否则既有的"超时归因到回收器"用例会因为消息里多一句
   "the cleanup not stopped" 而失败，且成败取决于新协程能否在 `ShutdownTimeout`
   内被调度到（我第一次跑就是这个现象）。
+
+## 示例服务（§5 第 1 项，2026-10-16 定）
+
+包 `example/basic`，定位＝演示"业务数据与任务行同一事务提交"这条卖点，并充当 §6 故障注入
+与 README 安装/用法示例的车辆。
+
+- **事务边界只写在一处**：`Store.CreateOrder` = `BeginTx` → `tx.ExecContext`（订单行）
+  → **同一个 `tx`** 调 `client.EnqueueTx` → `Commit`。库不开/不提交/不回滚调用方事务；
+  返回的 `taskID` 在提交前不具备"任务已存在"的含义。
+- **建表顺序固定**：`migrateSchema` 先 `mysqlmigrations.Migrate`（任务表，库的）再执行
+  `schema.sql`（业务表，示例自己的），最后才 `mysqlstore.New`（只读表、不建表）。
+- **幂等靠条件更新**：`UPDATE ... WHERE id = ? AND status = 'pending'`。影响 1 行＝首次；
+  影响 0 行＝**必须回读业务状态**区分"已导出"（返回 nil，**不是**错误）与"订单不存在"
+  （`Permanent`）。状态既非 pending 也非 exported ⇒ **可重试**失败（防"别的东西动过这行"）
+  ——既不能当成功，也不能武断判死。
+- **`Options.HandlerDelay` 只为演示存在**：Handler 在写回前先等这么久，用
+  `timer + select{<-timer.C, <-ctx.Done()}` 实现（`time.Sleep` 会让 Worker 白等满
+  `ShutdownTimeout`）。`cmd/demo` 的 `-handler-delay` 与 README 故障演示都用它。
+- `cmd/demo` 的进度表**只走公开 API**（`Store.GetOrder` + `Client.Get`），不自己写 SQL 查
+  任务表——示例要证明"使用方按文档接进来就够用"。
+- 测试用**第三个派生库** `gotask_example`（`store/mysql` 用 `gotask_store`，
+  `migrations/mysql` 直接用 `gotask`）。`app_test.go` 里三个装配期用例**不需要数据库**，
+  所以不跟着集成测试一起 skip。
+- `NewWorker` 要的是 `WorkerStore`（带 Claim/写回），而示例的 `App` 只暴露 `Client` 接口。
+  在 mysql 方言里两者是同一个具体类型，所以 `Open` 内部能过；测试里要自造 Worker 时，
+  得自己 `mysqlstore.New(app.DB, gorangetask.ClientConfig{})` 再 `NewWorker`。
+
+### 测试这一轮学到的两条
+
+1. **别拿"库里 `status` 变成 `running`"判断 Handler 已启动**：claim 提交与 Handler 启动之间
+   有窗口，在窗口里停机会让 `runOnce` 按设计跳过整批（Handler 根本不启动），而任务仍是
+   `running`、仍会被回收器接手——**终态和"真被打断"完全一样**，用例照样通过却什么都没测到。
+   修法是包一层 Handler、由它自己敲一个 `entered` 通道，用例等这个信号再停机。同一个坑在
+   §6「claim 后退出」那行已经踩过一次。
+2. **覆盖率在两个值之间浮动就是诊断信号**。发现方式：`-coverprofile` 跑三次，`total` 在
+   73.3%/77.2% 间跳。定位：`go tool cover -func` 的逐函数数字 + 对比两个 profile 里
+   "非零 branch"的差集 ⇒ 落在 `ExportOrderHandler` 的 `delay > 0` 那几行 ⇒ 说明有的运行里
+   Handler 根本没启动（即上面第 1 条）。修完连跑 5 次该分支每次都被覆盖，浮动消失。
+
+## ack 竞态（2026-10-16 修，由示例的端到端用例撞出）
+
+`TestExampleWorkerExportsOrders` 约 1/8 概率报 `task 2 status = "running"`。根因在库：
+`process` 判 `ctx.Err() != nil` 时停机还没开始，于是 `ack` 拿到的是**没脱离取消**的原 ctx；
+DB 往返途中 ctx 被取消 ⇒ 成功结果写不回去。直接违背 `ack` 注释里"已经成功返回的 Handler
+仍会尽力确认"的承诺。
+
+- **诊断手段**：`w.onError` 没有公开出口，临时给 `report` 加一行
+  `fmt.Fprintln(os.Stderr, ...)` ⇒ 一次拿到原文
+  `ack success for task 2: succeed task: context canceled`。诊断补丁用完即还原并核对 md5。
+  （顺带说明：§5「结构化日志」落地前，这类问题只能这样临时开洞看。）
+- **修法**：`ack` **总是**用 `context.WithTimeout(context.WithoutCancel(ctx), ShutdownTimeout)`。
+  只在"进入时已取消"才脱离是不够的；顺带把"数据库卡住"的等待也变成有界，与 `watchLease`
+  对续租的处理一致。失租的判断仍在 `process` 里排在 `ack` 之前（失租一律不写）。
+- **回归用例**：`TestWorkerAcksSuccessEvenIfShutdownStartsMidAck`。fake 新增钩子
+  `onSucceedEntered`（在 `Succeed` **进入之后、检查 ctx 之前**触发）——`onSucceed` 做不到，
+  它在这之后才触发。用例：钩子里 `close(entered)` 再等 `release`，主 goroutine 收到
+  `entered` 后 `cancel()` 再 `close(release)` ⇒ 停机被**确定性**卡在写回往返正中间。
+- **证伪**：把 `ack` 改回有条件脱离 ⇒ 新用例报 `succeeded = [], want [61]`，而既有的
+  `TestWorkerShutdownAcksHandlerThatFinishedInTime`（只覆盖"进来时 ctx 已取消"）仍通过
+  ⇒ 证明新用例覆盖的是一处真空白，不是重复。
+- 修复后 `TestExampleWorkerExportsOrders` 用 `-cover` 连跑 60 次 0 失败。

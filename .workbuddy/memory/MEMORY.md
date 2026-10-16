@@ -18,6 +18,9 @@
 - `store/mysql`：唯一写 SQL 处，**只读表不建表**；已实现 `Client` 与 `WorkerStore` + 编译期断言。
 - `migrations/mysql`：独立包（`//go:embed` 不能跨目录）。顺序＝先 `Migrate` 再 `mysqlstore.New`。
 - `Config`（Worker 侧）与 `ClientConfig`（入队侧）刻意分开。
+- `example/basic`：可独立运行的示例（业务行与任务行**同一事务** + 幂等 Handler + `cmd/demo` 入口）。
+  业务表属于示例、库不管它；`Open` 的建表顺序固定＝**迁移任务表 → 建业务表 → 构造 store**
+  （store 只读表不建表）。
 
 ## 本地库与测试
 
@@ -25,7 +28,8 @@
   跑测试前先 `status`，`Exited` 就先 `up`；**别在宿主机起 mysqld**（AppArmor 限 datadir）。
 - 集成测试由 `GOTASK_TEST_MYSQL_DSN` 开启，未设则 `t.Skip`。**统一一个 `gotask`**：
   `root:rootpw@tcp(127.0.0.1:3306)/gotask?parseTime=true&loc=UTC&timeout=5s&readTimeout=30s&writeTimeout=30s`；
-  `store/mysql` 自动派生 `gotask_store`；**每个集成测试包占独立库**（并发跑包 + 破坏性 Migrate）；
+  `store/mysql` 派生 `gotask_store`、`example/basic` 派生 `gotask_example`；
+  **每个集成测试包占独立库**（并发跑包 + 破坏性 Migrate）；
   旧 `gotask_test` 已废弃。⚠️ 驱动**默认不给读写设 deadline** —— 缺了超时，MySQL 一停顿就
   无限期挂住，整包被 `go test` 包级超时打掉（只剩 dump，其余结果全丢）。
   ⚠️ `migrations/mysql` 报 `Error 1049` **不是迁移失败**（挂在 `PingContext`）。
@@ -66,3 +70,12 @@
   直接自锁，dump 里只能看到同地址的 `Mutex.Lock`、看不出是 Once。用显式布尔标记。
 - **同一文件的多笔编辑必须串行**（一个消息里只放一笔）：并行下发会各自基于同一份旧内容
   替换、后写吞掉先写，而且**两笔都会报成功**。
+- **成功确认（`ack`）必须总是脱离停机取消**：只在「进入 `ack` 时 `ctx.Err() != nil`」才脱离会漏掉
+  一个窗口——进去时停机还没开始、DB 往返途中才取消 ⇒ 成功结果写不回去、任务白跑一遍。测这条
+  性质要把停机**确定性地卡在写回往返中间**（fake 的 `onSucceedEntered` 钩子）；只测「进来时已取消」
+  的用例抓不到它。
+- **别拿「库里 `status` 变成 `running`」判断 Handler 已启动**：claim 提交与 Handler 启动之间有窗口，
+  在窗口里停机会让 `runOnce` 按设计跳过整批、Handler 根本没启动，而终态与「真被打断」一模一样
+  ⇒ 用例照样通过却没测到东西。用 Handler 自己发的信号（通道）。**这个坑已踩过两次**。
+- **覆盖率在两个值之间浮动就是诊断信号**：说明有分支只是偶尔被执行 ⇒ 用例时而没走到它想走的
+  场景。用 `-coverprofile` 跑几次、比非零分支的差集，能定位到具体行并揪出用例的时序缺陷。
