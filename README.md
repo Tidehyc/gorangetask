@@ -440,6 +440,7 @@ err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 - [进度跟踪](docs/GoRangeTask-进度跟踪.md)：阶段状态、完成标准和可核验的实现证据。
 - [性能基线](docs/GoRangeTask-性能基线.md)：硬件/MySQL/Worker 配置、入队延迟、吞吐与伸缩、排队延迟、事务完整率、崩溃恢复耗时，以及**这些数字不能用来声称什么**。
 - [STAR 说明](docs/GoRangeTask-STAR.md)：项目定位、与手写 SQL 及 Outbox/RabbitMQ 的区别、简历证据框架（R 段为实测值）。
+- [下一步计划](docs/GoRangeTask-下一步计划.md)：还没做的事按"证据缺口 / 能力缺口 / 工程化"分优先级，每项都写清验收判据；同时列出**明确不做**的边界。
 
 ## 许可
 
