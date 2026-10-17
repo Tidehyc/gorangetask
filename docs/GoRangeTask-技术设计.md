@@ -2,8 +2,8 @@
 
 > 项目名：GoRangeTask（仓库名：`gorangetask`）。
 > Go module 路径：`github.com/Tidehyc/gorangetask`（已由本机 `gh auth status` 复核：账号 `Tidehyc`，token 有效，scopes 含 `repo`）。
-> 版本：v0.1
-> 状态：实现前技术基线；SQL 与默认参数需在 MySQL 集成测试中验证。
+> 文档版本：v0.1
+> 状态：设计基线（已落地）。文中 SQL 与默认参数已在 MySQL 8.0.46 集成测试中验证，逐项证据见[进度跟踪](./GoRangeTask-进度跟踪.md)。
 > 范围：独立 Go 任务队列 MVP。GCFeed 仅作为未来可选集成。
 > 上位需求：[GoRangeTask-需求文档.md](./GoRangeTask-需求文档.md)
 
@@ -468,7 +468,7 @@ tx.Statement.ConnPool
 
 - **claim commit 后、Handler 开始前**：不需要开关。把 `ShutdownTimeout` 设得小于 Handler 耗时即可——停机超时后 `Run` 返回 `ErrShutdownTimeout`，在途任务保持 `running`。已由 `TestWorkerReapsTaskAbandonedByShutdown` 覆盖。
 - **副作用完成后、成功写回前**：由"Handler 在副作用之后返回一个普通错误"制造，而不是真的 kill 进程。两者在库侧**完全等价**：库对"没拿到成功写回"只有一条处理路径（按失败重试），它并不区分 Handler 是返回了错误、panic 了还是进程没了。已由 `TestExampleExportSideEffectHappensOnceAcrossAFailedAck` 覆盖（断言业务时间戳在重试前后不变）。
-- **旧 Worker 复苏后尝试写回**：仍待补。机制侧已有等价证据（§6 fencing 的三条写回拒绝），缺的是"让一个旧 Worker 延迟苏醒再真的尝试写回"的端到端场景。
+- **旧 Worker 复苏后尝试写回**：已由 `TestRevivedWorkerCannotWriteBackAfterTakeover`（`store/mysql/revival_integration_test.go`）端到端覆盖。做法是起一个**真的子进程**当旧 Worker，让它在 Handler 跑完、写回之前停下并发信号，然后 `SIGSTOP` 冻结整个进程——连续租一起停住，这是"进程没了"唯一无法用开关伪造的部分；等租约自然过期、另一个 Worker 接手并改写 `lease_owner` / `lease_epoch`，再 `SIGCONT` 放行那条陈旧写回：写回按 §6 的 fencing 条件被拒（错误里带 `ErrLeaseLost`），任务行逐字段与解冻前一致，旧 Worker 的日志里也没有成功记录。
 
 刻意**不**加"在某处直接 kill 进程"的钩子：那会把进程控制塞进库或示例的公开面，代价大于收益；上面第一条已经真实地产生了"进程没了"的效果——回收器接手那条链路是真的走了一遍。
 
