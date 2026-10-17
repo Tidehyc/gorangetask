@@ -122,7 +122,7 @@
 | [x] | 并发正确性测试 | N 个 worker 并发处理 M 个任务，同租约期每项至多一位有效持有者 | §3「多 Worker 并发领取」三件套已覆盖（提交 `454ccac`）：8 领取者同一栅栏后抢 40 条（两层断言：进程侧 id 不重不漏 + **库侧 `lease_epoch`/`attempt` 全为 1** 的独立复核）、跨会话 `SKIP LOCKED` 跳过被锁行、4 Worker（各 2 并发）跑 24 条且每条 Handler **恰好执行 1 次**。真库上还顺带排除"租约过期被重领"这一混淆因素（领取用 `LeaseDuration = time.Minute`）。 |
 | [x] | 故障注入：claim 后退出 | 租约过期后任务能重新执行并最终完成 | 2026-10-15 提交 `75c2e04`：`TestWorkerReapsTaskAbandonedByShutdown` 端到端覆盖——Worker A 的 Handler **无视 ctx**，停机只能超时放弃（`Run` 返回 `ErrShutdownTimeout`），任务留在 `running`；A 的续租看护随停机一起停掉，租约按配置的 `LeaseDuration` **自然过期**（不手工改库）；另一个 Worker 的回收器把它捡回 `pending`，随后被领出来跑完。整个链路只走产品路径，且不依赖任何手工构造的过期租约。**这条用例的写法有个坑值得记下**：必须等 Handler **真的进去了**（用例里用 channel 由 Handler 自己发信号）再取消 A——只等库里的 `status` 变成 `running` 是不够的，claim 提交与 Handler 启动之间有个窗口，在那里停机会让 `runOnce` 按设计跳过整批（剩余任务不启动 Handler），于是 `Run` 干净返回 `nil`——那是正确行为，却让用例测不到它想测的东西。 |
 | [x] | 故障注入：副作用后 ack 前退出 | 允许重复执行，幂等示例最终效果正确 | 2026-10-16：由示例服务提供车辆——`TestExampleExportSideEffectHappensOnceAcrossAFailedAck` 包一层示例自己的 Handler，让**第一遍成功做完副作用之后返回一个普通错误**（模拟"副作用已落库、成功写回没送到"），把"重复执行"交给库的重试机制自己产生，再断言：Handler 恰好被调用 **2** 次、`attempt == 2`、两次读到的 `exported_at` **完全相同**（第二次的条件更新影响 0 行，什么都没改）、成功写回把第一次的失败摘要清空。**注入方式的说明**：这里制造的是"Handler 在副作用之后失败"，不是真的 kill 进程——两者在库侧**完全等价**，因为库对"没拿到成功写回"只有一条处理路径（按失败重试），它并不区分 Handler 是返回了错误、panic 了还是进程没了；"进程真的在这一刻消失"的版本由 §6 第一条（停机超时放弃 ⇒ 回收器接手）与 §5 的故障演示负责展示。**证伪检查**：去掉条件更新的 `AND status = 'pending'` ⇒ 用例报出重试前后 `exported_at` 相差约 1s（正是退避延迟），说明这条断言钉的是"副作用只发生一次"而不是"任务最终 succeeded"。 |
-| [ ] | 故障注入：旧 worker 复苏 | fencing 拒绝过期 worker 写回 | 待实现——机制侧已有等价证据：§3 三条写回与 2026-10-15 的续租都用**陈旧 owner/epoch、已过期租约**直接验证了 `ErrLeaseLost` 且库里零痕迹。缺的是"让一个旧 Worker 延迟苏醒再真的尝试写回"的端到端场景，等示例服务再补。 |
+| [x] | 故障注入：旧 worker 复苏 | fencing 拒绝过期 worker 写回 | 2026-10-17：端到端用例 `TestRevivedWorkerCannotWriteBackAfterTakeover`（`store/mysql/revival_integration_test.go`），**真子进程 + `SIGSTOP`**。为什么必须是子进程：进程被冻结时它自己的续租看护也一起停摆，这正是"租约为什么会过期"的原因；同一个进程里没法只冻结一半 goroutine。冻结点由子进程 store 的 `Succeed` 门闸固定——报到并阻塞在 stdin 上，父进程看到报到才 `SIGSTOP`；**注入的是时间点而不是行为**：放行之后执行的是真实的 `Succeed`、真实 SQL 与真实的 `(owner, epoch, 租约未过期)` 条件更新。时间线：A 领取（epoch 1）→ Handler 成功返回 → 卡在写回之前 → `SIGSTOP` → 租约按配置（2s）**自然过期**（不手工改库）→ B 的回收器把任务交还队列 → B 领取（attempt 2、epoch 2）并**停在 Handler 里继续持有** → 解冻 A，它拿 epoch 1 执行成功写回 → 被拒，错误原文 `gorangetask: lease lost: task 1 (owner "…", epoch 1)` → 整行快照（status/payload/attempt/lease_epoch/lease_owner/lease_until/last_error/run_at/created_at/updated_at/finished_at）**一个字段都没变**，且 A 从未记过 `task succeeded`（反面另断言它确实报了一条 `worker error`——只断言"没写成功"不够，它也可能什么都没做）。**关键判别条件：解冻那一刻任务必须仍是 `running`**。第一版让 B 先把任务跑成 `succeeded`，于是 `WHERE status = 'running'` 一条就足以拒掉 A——用例能过，却证明不了 owner/epoch 有任何作用，测的其实是"不能改写已完成的任务"。改成 B 持有不放才逼出真问题：谁有权写。**证伪 1 条**：删掉 `AND lease_owner = ? AND lease_epoch = ?`（连带入参）⇒ A 的写回**成功**（`REVIVAL_ACK_APPLIED` + `msg=task succeeded`），用例在等待 `REVIVAL_ACK_REJECTED` 处 30s 超时失败；还原后 md5 与备份一致。连跑 5 次全过、`-race` 一次通过（单次约 2.5s）。**一处刻意未覆盖**：本场景里 owner 与 epoch 同时不等，因此单删 epoch 谓词检测不出来；两个谓词各自的独立作用由 §3 那三条写回用例负责（同 owner、陈旧 epoch），二者互补而非重复。 |
 | [x] | Race 检查 | `go test -race` 覆盖 worker 内部并发路径 | 全量 `go test -race -count=1 ./...` 三个包全绿、日志中 **0 处 `DATA RACE`**（2026-10-15 复跑：154 个顶层用例 / 290 条 PASS 记录、0 FAIL、0 SKIP；`store/mysql` 97.9s）。worker 内部并发路径（并发领取池、每条任务一个租约看护协程、**回收循环**、停机与失租同时取消）都在 `-race` 下跑过。根包语句覆盖 100.0%，`store/mysql` 91.4%。 |
 | [ ] | 性能基线 | 记录硬件/DB/配置、吞吐、排队延迟、API/DB成本 | 待实现 |
 | [x] | README 与语义说明 | 安装、使用、事务入队、至少一次、幂等、恢复和限制齐全 | 完成——**语义部分已齐**（项目定位、执行语义与边界、至少一次与幂等、fencing 保护范围、本地环境、文档索引，2026-10-15 已把自相矛盾的状态段改成分「已可用/尚未实现」）；**安装与最小用法已于 2026-10-16 补齐**：新增「安装」节（`go get`、核心包除 MySQL 驱动外无第三方依赖、接入三步顺序不可换且 store 只读表不建表）与「快速开始：业务数据与任务同事务」节（同事务入队的完整代码、必须幂等的 Handler 及其永久错误用法、`NewWorker` + `Run` 与停机语义、并指向 `example/basic` 与 `go run ./example/basic/cmd/demo` 这个可运行入口）。**故障恢复演示于 2026-10-16 补齐**：新增「故障演示：停机打断 → 租约过期 → 换人接手」一节（两条可直接粘贴的命令 + 实测输出，含「租约到期本身不改变任何东西」这一条）。至此本项的完成标准（安装、使用、事务入队、至少一次、幂等、恢复和限制）全部齐全。 |
@@ -130,21 +130,16 @@
 
 ## 当前可开工项
 
-**§0–§5 全部完成**（§4 7/7、§5 5/5），§6 完成 6/11。§5 的最后三项于 2026-10-16 落地：
-**结构化日志**（`Config.Logger`，字段对齐需求 §8、payload 永不入日志）、**Metrics 接口**
-（`Config.Metrics` + `ClientConfig.Metrics`，具名事件、标签集合由库固定）、**官方 GORM adapter**
-（`adapter/gorm`，从 `*gorm.DB` 取 `Statement.ConnPool` 复用同一条 INSERT，并拒绝非事务句柄）。
-回收器与清理器落地后 §3 的两个缺口（停机超时、进程崩溃遗留的 `running`）已经闭合，§6 的
-三条「故障注入」里已有两条可验证（「claim 后退出」与「副作用后 ack 前退出」）。
+**§0–§5 全部完成**（§4 7/7、§5 5/5），§6 完成 **7/11**。三条「故障注入」现在全部可验证：
+「claim 后退出」、「副作用后 ack 前退出」，以及 2026-10-17 补上的「旧 worker 复苏」
+——真子进程被 `SIGSTOP` 冻结 → 租约按配置自然过期 → 另一个 Worker 接手并持有 → 解冻后
+旧执行者那条陈旧 epoch 的写回被条件更新拒绝，整行零改动。
 
-**§6 还剩三项，其中两项互为前提**：
+**§6 还剩两项，且互为前提**：
 
 1. **性能基线**（`[ ]`）——需要记录硬件 / DB / 配置、吞吐、排队延迟、API 与 DB 成本。
-   这是 §6 里唯一还没做的**实测**项，也是下面第三项的前提。
-2. **故障注入：旧 worker 复苏**（`[ ]`）——机制侧已有等价证据：§3 的三条写回与续租都用
-   陈旧 owner/epoch、已过期租约直接验证了 `ErrLeaseLost` 且库里零痕迹。缺的只是"让一个旧
-   Worker 延迟苏醒、再真的尝试写回"的端到端场景。
-3. **STAR 指标回填**（`[ ]`）——只写实测数值并保留命令、环境与原始结果；没有基线就一个
+   这是 §6 里唯一还没做的**实测**项，也是下面第二项的前提。
+2. **STAR 指标回填**（`[ ]`）——只写实测数值并保留命令、环境与原始结果；没有基线就一个
    数字都不能填，所以它排在 1 之后。
 
 另外记一条当前的 API 边界：公开接口只有"按 ID 查任务"，**没有"按队列列举"**。
