@@ -1,0 +1,713 @@
+{
+  "meta": {
+    "generated_at": "2026-10-17T15:46:34+08:00",
+    "go_version": "go1.27.0",
+    "num_cpu": 4,
+    "cpu_model": "Intel(R) Core(TM) i5-8200Y CPU @ 1.30GHz",
+    "mem_total_kb": 16269596,
+    "load_avg_before": "3.01 5.03 4.33",
+    "load_avg_after": "4.30 5.84 5.13",
+    "mysql_version": "8.0.46",
+    "mysql_variables": {
+      "binlog_format": "ROW",
+      "innodb_buffer_pool_size": "134217728",
+      "innodb_flush_log_at_trx_commit": "1",
+      "innodb_flush_method": "fsync",
+      "max_connections": "151",
+      "sync_binlog": "1",
+      "transaction_isolation": "READ-COMMITTED"
+    },
+    "db_host": "127.0.0.1:3306",
+    "db_name": "gotask_bench",
+    "pool_settings": "MaxOpenConns=32 MaxIdleConns=32 ConnMaxLifetime=0（bench 固定值）",
+    "worker_config": {
+      "batch_size": "1",
+      "cleanup": "关闭（CleanupInterval=-1，避免删掉要统计的终态行）",
+      "concurrency": "见各场景（并发池大小；Run 按它起同等数量的领取 goroutine）",
+      "handler_timeout": "30s",
+      "heartbeat_interval": "10s",
+      "lease_duration": "30s",
+      "max_poll_interval": "2s",
+      "poll_interval": "250ms",
+      "queues": "bench",
+      "reaper": "关闭（ReapInterval=-1，隔离出干净的吞吐数字）",
+      "shutdown_timeout": "30s"
+    },
+    "notes": [
+      "压测进程与 MySQL 跑在同一台机器上，两者抢同一批 CPU 核：吞吐偏悲观，延迟偏乐观（进程内计时不含网络）。",
+      "没有网络跳数：客户端与数据库之间是 loopback，所以入队延迟只反映 SQL 与 fsync 的成本。",
+      "innodb_flush_log_at_trx_commit=1 且 sync_binlog=1 时，每次提交都要落盘，提交类延迟的下限由磁盘 fsync 决定。"
+    ]
+  },
+  "enqueue": [
+    {
+      "mode": "producer_tx_baseline",
+      "producers": 8,
+      "calls": 800,
+      "wall_seconds": 3.950767169,
+      "throughput_per_s": 202.4923175117131,
+      "call_latency": {
+        "n": 800,
+        "p50_ms": 36.507,
+        "p95_ms": 62.369,
+        "p99_ms": 76.83,
+        "max_ms": 93.59,
+        "mean_ms": 38.87
+      }
+    },
+    {
+      "mode": "producer_tx",
+      "producers": 8,
+      "calls": 800,
+      "wall_seconds": 7.023633153,
+      "throughput_per_s": 113.90116519088082,
+      "call_latency": {
+        "n": 800,
+        "p50_ms": 66.638,
+        "p95_ms": 105.155,
+        "p99_ms": 139.393,
+        "max_ms": 156.06,
+        "mean_ms": 69.371
+      }
+    },
+    {
+      "mode": "enqueue",
+      "producers": 8,
+      "calls": 800,
+      "wall_seconds": 3.004920694,
+      "throughput_per_s": 266.2299878986424,
+      "call_latency": {
+        "n": 800,
+        "p50_ms": 27.21,
+        "p95_ms": 51.917,
+        "p99_ms": 68.825,
+        "max_ms": 82.533,
+        "mean_ms": 29.708
+      }
+    }
+  ],
+  "enqueue_overhead": {
+    "mean_baseline_ms": 38.87,
+    "mean_with_task_ms": 69.371,
+    "mean_delta_ms": 30.501,
+    "throughput_baseline_per_s": 202.492,
+    "throughput_with_task_per_s": 113.901,
+    "throughput_change_percent": -43.75
+  },
+  "drain": [
+    {
+      "workers": 1,
+      "payload_bytes": 256,
+      "tasks": 1000,
+      "prefill_seconds": 7.397702651,
+      "drain_seconds": 34.321037338,
+      "throughput_per_s": 29.136648468745655,
+      "claim_latency": {
+        "n": 1001,
+        "p50_ms": 20.956,
+        "p95_ms": 35.512,
+        "p99_ms": 48.584,
+        "max_ms": 81.627,
+        "mean_ms": 22.94
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 20098.159,
+        "p95_ms": 32798.805,
+        "p99_ms": 33973.365,
+        "max_ms": 34316.436,
+        "mean_ms": 20512.69
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.016,
+        "p95_ms": 0.031,
+        "p99_ms": 0.151,
+        "max_ms": 0.667,
+        "mean_ms": 0.021
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 1
+      },
+      "db_delta": {
+        "questions": 6004,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 1,
+        "max_idle": 8,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 18,
+        "mean_percent_of_one_core": 39.41,
+        "max_percent_of_one_core": 74.18
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 4,
+      "payload_bytes": 256,
+      "tasks": 1000,
+      "prefill_seconds": 4.963187051,
+      "drain_seconds": 20.260494414,
+      "throughput_per_s": 49.35713707504591,
+      "claim_latency": {
+        "n": 1004,
+        "p50_ms": 44.822,
+        "p95_ms": 92.524,
+        "p99_ms": 112.082,
+        "max_ms": 145.15,
+        "mean_ms": 50.764
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 12420.901,
+        "p95_ms": 19369.064,
+        "p99_ms": 20082.879,
+        "max_ms": 20237.991,
+        "mean_ms": 12488.646
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.017,
+        "p95_ms": 0.031,
+        "p99_ms": 0.135,
+        "max_ms": 1.859,
+        "mean_ms": 0.022
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 4
+      },
+      "db_delta": {
+        "questions": 6013,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 4,
+        "max_idle": 8,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 11,
+        "mean_percent_of_one_core": 81.9,
+        "max_percent_of_one_core": 112.86
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 16,
+      "payload_bytes": 256,
+      "tasks": 1000,
+      "prefill_seconds": 4.848962062,
+      "drain_seconds": 10.460498973,
+      "throughput_per_s": 95.59773415982725,
+      "claim_latency": {
+        "n": 1016,
+        "p50_ms": 98.579,
+        "p95_ms": 153.878,
+        "p99_ms": 186.64,
+        "max_ms": 202.666,
+        "mean_ms": 102.971
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 7695.803,
+        "p95_ms": 10107.014,
+        "p99_ms": 10366.968,
+        "max_ms": 10467.514,
+        "mean_ms": 7712.647
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.016,
+        "p95_ms": 0.028,
+        "p99_ms": 0.163,
+        "max_ms": 1.672,
+        "mean_ms": 0.021
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 16
+      },
+      "db_delta": {
+        "questions": 6046,
+        "innodb_row_lock_waits": 1,
+        "innodb_row_lock_time_ms": 8
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 16,
+        "max_idle": 14,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 6,
+        "mean_percent_of_one_core": 124.89,
+        "max_percent_of_one_core": 169.82
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 1,
+      "payload_bytes": 4096,
+      "tasks": 1000,
+      "prefill_seconds": 6.789194941,
+      "drain_seconds": 38.96051961,
+      "throughput_per_s": 25.66700880815075,
+      "claim_latency": {
+        "n": 1001,
+        "p50_ms": 23.719,
+        "p95_ms": 39.187,
+        "p99_ms": 64.117,
+        "max_ms": 108.334,
+        "mean_ms": 25.757
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 21612.19,
+        "p95_ms": 37168.682,
+        "p99_ms": 38563.991,
+        "max_ms": 38952.17,
+        "mean_ms": 22068.824
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.017,
+        "p95_ms": 0.032,
+        "p99_ms": 0.174,
+        "max_ms": 1.663,
+        "mean_ms": 0.023
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 1
+      },
+      "db_delta": {
+        "questions": 6002,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 1,
+        "max_idle": 14,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 20,
+        "mean_percent_of_one_core": 39.88,
+        "max_percent_of_one_core": 66.97
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 4,
+      "payload_bytes": 4096,
+      "tasks": 1000,
+      "prefill_seconds": 5.803170999,
+      "drain_seconds": 27.240489708,
+      "throughput_per_s": 36.71005957379392,
+      "claim_latency": {
+        "n": 1004,
+        "p50_ms": 51.74,
+        "p95_ms": 115.452,
+        "p99_ms": 182.522,
+        "max_ms": 536.944,
+        "mean_ms": 63.802
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 13422.801,
+        "p95_ms": 25644.068,
+        "p99_ms": 26878.308,
+        "max_ms": 27180.109,
+        "mean_ms": 14568.936
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.017,
+        "p95_ms": 0.03,
+        "p99_ms": 0.147,
+        "max_ms": 0.33,
+        "mean_ms": 0.02
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 4
+      },
+      "db_delta": {
+        "questions": 6013,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 4,
+        "max_idle": 13,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 14,
+        "mean_percent_of_one_core": 65.75,
+        "max_percent_of_one_core": 108.37
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 16,
+      "payload_bytes": 4096,
+      "tasks": 1000,
+      "prefill_seconds": 8.379535717,
+      "drain_seconds": 15.520609588,
+      "throughput_per_s": 64.43045901838582,
+      "claim_latency": {
+        "n": 1018,
+        "p50_ms": 140.826,
+        "p95_ms": 223.485,
+        "p99_ms": 324.762,
+        "max_ms": 779.512,
+        "mean_ms": 146.581
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 12428.665,
+        "p95_ms": 15025.717,
+        "p99_ms": 15487.16,
+        "max_ms": 15553.385,
+        "mean_ms": 11837.259
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.016,
+        "p95_ms": 0.028,
+        "p99_ms": 0.411,
+        "max_ms": 2.072,
+        "mean_ms": 0.026
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 16
+      },
+      "db_delta": {
+        "questions": 6045,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 16,
+        "max_idle": 12,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 9,
+        "mean_percent_of_one_core": 127.58,
+        "max_percent_of_one_core": 202.57
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 1,
+      "payload_bytes": 32768,
+      "tasks": 1000,
+      "prefill_seconds": 12.039577483,
+      "drain_seconds": 82.720984701,
+      "throughput_per_s": 12.088830949178861,
+      "claim_latency": {
+        "n": 1001,
+        "p50_ms": 40.159,
+        "p95_ms": 103.336,
+        "p99_ms": 142.483,
+        "max_ms": 260.614,
+        "mean_ms": 51.354
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 38141.598,
+        "p95_ms": 77993.776,
+        "p99_ms": 81532.996,
+        "max_ms": 82828.27,
+        "mean_ms": 42927.917
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.017,
+        "p95_ms": 0.044,
+        "p99_ms": 0.336,
+        "max_ms": 1.897,
+        "mean_ms": 0.03
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 1
+      },
+      "db_delta": {
+        "questions": 6004,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 1,
+        "max_idle": 11,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 42,
+        "mean_percent_of_one_core": 41.58,
+        "max_percent_of_one_core": 69.64
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 4,
+      "payload_bytes": 32768,
+      "tasks": 1000,
+      "prefill_seconds": 19.267828893,
+      "drain_seconds": 38.260675028,
+      "throughput_per_s": 26.136496527261425,
+      "claim_latency": {
+        "n": 1004,
+        "p50_ms": 82.966,
+        "p95_ms": 171.288,
+        "p99_ms": 209.053,
+        "max_ms": 258.025,
+        "mean_ms": 92.562
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 29454.205,
+        "p95_ms": 37432.336,
+        "p99_ms": 38404.25,
+        "max_ms": 38491.106,
+        "mean_ms": 29394.847
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.018,
+        "p95_ms": 0.031,
+        "p99_ms": 0.213,
+        "max_ms": 1.851,
+        "mean_ms": 0.028
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 4
+      },
+      "db_delta": {
+        "questions": 6013,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 4,
+        "max_idle": 10,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 20,
+        "mean_percent_of_one_core": 110.87,
+        "max_percent_of_one_core": 145.21
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    },
+    {
+      "workers": 16,
+      "payload_bytes": 32768,
+      "tasks": 1000,
+      "prefill_seconds": 19.532265147,
+      "drain_seconds": 19.980103331,
+      "throughput_per_s": 50.049791206457705,
+      "claim_latency": {
+        "n": 1016,
+        "p50_ms": 172.686,
+        "p95_ms": 349.155,
+        "p99_ms": 408.454,
+        "max_ms": 469.563,
+        "mean_ms": 191.229
+      },
+      "queue_wait": {
+        "n": 1000,
+        "p50_ms": 21052.008,
+        "p95_ms": 21873.671,
+        "p99_ms": 21981.553,
+        "max_ms": 22078.897,
+        "mean_ms": 21040.566
+      },
+      "processing": {
+        "n": 1000,
+        "p50_ms": 0.017,
+        "p95_ms": 0.03,
+        "p99_ms": 0.244,
+        "max_ms": 4.913,
+        "mean_ms": 0.031
+      },
+      "outcomes": {
+        "claimed": 1000,
+        "succeeded": 1000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 16
+      },
+      "db_delta": {
+        "questions": 6049,
+        "innodb_row_lock_waits": 1,
+        "innodb_row_lock_time_ms": 6
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 16,
+        "max_idle": 16,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 11,
+        "mean_percent_of_one_core": 172.11,
+        "max_percent_of_one_core": 261.27
+      },
+      "final_status_counts": {
+        "succeeded": 1000
+      }
+    }
+  ],
+  "idle": [
+    {
+      "workers": 1,
+      "seconds": 15.005082965,
+      "db_questions": 29,
+      "db_qps": 1.9326784175498226,
+      "db_qps_per_worker": 1.9326784175498226,
+      "mysql_cpu": {
+        "samples": 11,
+        "mean_percent_of_one_core": 3.52,
+        "max_percent_of_one_core": 9.75
+      }
+    },
+    {
+      "workers": 4,
+      "seconds": 15.005432305,
+      "db_questions": 125,
+      "db_qps": 8.330316478676087,
+      "db_qps_per_worker": 2.0825791196690218,
+      "mysql_cpu": {
+        "samples": 11,
+        "mean_percent_of_one_core": 2.35,
+        "max_percent_of_one_core": 4.57
+      }
+    },
+    {
+      "workers": 16,
+      "seconds": 15.005492553,
+      "db_questions": 493,
+      "db_qps": 32.85463627792985,
+      "db_qps_per_worker": 2.0534147673706156,
+      "mysql_cpu": {
+        "samples": 11,
+        "mean_percent_of_one_core": 6.82,
+        "max_percent_of_one_core": 16.93
+      }
+    }
+  ]
+}
