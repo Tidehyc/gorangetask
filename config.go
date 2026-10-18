@@ -155,61 +155,52 @@ type Config struct {
 	Metrics Metrics
 }
 
+// defaultIfZero 是泛型辅助函数：若 val 为其类型的零值，则返回 def。
+func defaultIfZero[T comparable](val, def T) T {
+	var zero T
+	if val == zero {
+		return def
+	}
+	return val
+}
+
+// checkPositive 校验整数或时长是否严格大于 0，违规时向 errs 追加格式化错误。
+func checkPositive[T ~int | ~int64](errs *[]error, name string, val T) {
+	if val <= 0 {
+		*errs = append(*errs, fmt.Errorf("%s must be > 0, got %v", name, val))
+	}
+}
+
+// checkOrder 校验 maxVal 须不小于 minVal。
+func checkOrder(errs *[]error, minName, maxName string, minVal, maxVal time.Duration) {
+	if maxVal > 0 && minVal > 0 && maxVal < minVal {
+		*errs = append(*errs, fmt.Errorf("%s (%s) must be >= %s (%s)", maxName, maxVal, minName, minVal))
+	}
+}
+
 // WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。
 // 它不修改接收者，也不做合法性校验；校验请调用 Validate。
 func (c Config) WithDefaults() Config {
 	if len(c.Queues) == 0 {
 		c.Queues = []string{DefaultQueue}
 	}
-	if c.Concurrency == 0 {
-		c.Concurrency = DefaultConcurrency
-	}
-	if c.PollInterval == 0 {
-		c.PollInterval = DefaultPollInterval
-	}
-	if c.MaxPollInterval == 0 {
-		c.MaxPollInterval = DefaultMaxPollInterval
-	}
-	if c.BatchSize == 0 {
-		c.BatchSize = DefaultBatchSize
-	}
-	if c.LeaseDuration == 0 {
-		c.LeaseDuration = DefaultLeaseDuration
-	}
-	if c.HeartbeatInterval == 0 {
-		c.HeartbeatInterval = DefaultHeartbeatInterval
-	}
+	c.Concurrency = defaultIfZero(c.Concurrency, DefaultConcurrency)
+	c.PollInterval = defaultIfZero(c.PollInterval, DefaultPollInterval)
+	c.MaxPollInterval = defaultIfZero(c.MaxPollInterval, DefaultMaxPollInterval)
+	c.BatchSize = defaultIfZero(c.BatchSize, DefaultBatchSize)
+	c.LeaseDuration = defaultIfZero(c.LeaseDuration, DefaultLeaseDuration)
+	c.HeartbeatInterval = defaultIfZero(c.HeartbeatInterval, DefaultHeartbeatInterval)
 	// 只填 0：负值是有含义的（关闭回收器），不能被默认值覆盖掉。
-	if c.ReapInterval == 0 {
-		c.ReapInterval = DefaultReapInterval
-	}
-	if c.ShutdownTimeout == 0 {
-		c.ShutdownTimeout = DefaultShutdownTimeout
-	}
-	if c.HandlerTimeout == 0 {
-		c.HandlerTimeout = DefaultHandlerTimeout
-	}
-	if c.MaxPayloadSize == 0 {
-		c.MaxPayloadSize = DefaultMaxPayloadSize
-	}
-	if c.RetryBaseDelay == 0 {
-		c.RetryBaseDelay = DefaultRetryBaseDelay
-	}
-	if c.RetryMaxDelay == 0 {
-		c.RetryMaxDelay = DefaultRetryMaxDelay
-	}
-	if c.SucceededRetention == 0 {
-		c.SucceededRetention = DefaultSucceededRetention
-	}
-	if c.DeadRetention == 0 {
-		c.DeadRetention = DefaultDeadRetention
-	}
-	if c.CleanupBatchSize == 0 {
-		c.CleanupBatchSize = DefaultCleanupBatchSize
-	}
-	if c.CleanupInterval == 0 {
-		c.CleanupInterval = DefaultCleanupInterval
-	}
+	c.ReapInterval = defaultIfZero(c.ReapInterval, DefaultReapInterval)
+	c.ShutdownTimeout = defaultIfZero(c.ShutdownTimeout, DefaultShutdownTimeout)
+	c.HandlerTimeout = defaultIfZero(c.HandlerTimeout, DefaultHandlerTimeout)
+	c.MaxPayloadSize = defaultIfZero(c.MaxPayloadSize, DefaultMaxPayloadSize)
+	c.RetryBaseDelay = defaultIfZero(c.RetryBaseDelay, DefaultRetryBaseDelay)
+	c.RetryMaxDelay = defaultIfZero(c.RetryMaxDelay, DefaultRetryMaxDelay)
+	c.SucceededRetention = defaultIfZero(c.SucceededRetention, DefaultSucceededRetention)
+	c.DeadRetention = defaultIfZero(c.DeadRetention, DefaultDeadRetention)
+	c.CleanupBatchSize = defaultIfZero(c.CleanupBatchSize, DefaultCleanupBatchSize)
+	c.CleanupInterval = defaultIfZero(c.CleanupInterval, DefaultCleanupInterval)
 	return c
 }
 
@@ -228,29 +219,17 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.Concurrency <= 0 {
-		errs = append(errs, fmt.Errorf("concurrency must be > 0, got %d", c.Concurrency))
-	}
-	if c.PollInterval <= 0 {
-		errs = append(errs, fmt.Errorf("poll interval must be > 0, got %s", c.PollInterval))
-	}
-	if c.MaxPollInterval <= 0 {
-		errs = append(errs, fmt.Errorf("max poll interval must be > 0, got %s", c.MaxPollInterval))
-	}
-	if c.MaxPollInterval > 0 && c.PollInterval > 0 && c.MaxPollInterval < c.PollInterval {
-		errs = append(errs, fmt.Errorf("max poll interval (%s) must be >= poll interval (%s)", c.MaxPollInterval, c.PollInterval))
-	}
+	checkPositive(&errs, "concurrency", c.Concurrency)
+	checkPositive(&errs, "poll interval", c.PollInterval)
+	checkPositive(&errs, "max poll interval", c.MaxPollInterval)
+	checkOrder(&errs, "poll interval", "max poll interval", c.PollInterval, c.MaxPollInterval)
 
 	if c.BatchSize < 1 || c.BatchSize > MaxBatchSize {
 		errs = append(errs, fmt.Errorf("batch size must be in [1, %d], got %d", MaxBatchSize, c.BatchSize))
 	}
 
-	if c.LeaseDuration <= 0 {
-		errs = append(errs, fmt.Errorf("lease duration must be > 0, got %s", c.LeaseDuration))
-	}
-	if c.HeartbeatInterval <= 0 {
-		errs = append(errs, fmt.Errorf("heartbeat interval must be > 0, got %s", c.HeartbeatInterval))
-	}
+	checkPositive(&errs, "lease duration", c.LeaseDuration)
+	checkPositive(&errs, "heartbeat interval", c.HeartbeatInterval)
 	// 心跳必须严格小于租约，否则续期来不及在租约到期前完成。
 	if c.HeartbeatInterval > 0 && c.LeaseDuration > 0 && c.HeartbeatInterval >= c.LeaseDuration {
 		errs = append(errs, fmt.Errorf("heartbeat interval (%s) must be < lease duration (%s)", c.HeartbeatInterval, c.LeaseDuration))
@@ -262,35 +241,17 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("reap interval must not be 0 (use a negative value to disable the reaper)"))
 	}
 
-	if c.ShutdownTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("shutdown timeout must be > 0, got %s", c.ShutdownTimeout))
-	}
-	if c.HandlerTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("handler timeout must be > 0, got %s", c.HandlerTimeout))
-	}
-	if c.MaxPayloadSize <= 0 {
-		errs = append(errs, fmt.Errorf("max payload size must be > 0, got %d", c.MaxPayloadSize))
-	}
+	checkPositive(&errs, "shutdown timeout", c.ShutdownTimeout)
+	checkPositive(&errs, "handler timeout", c.HandlerTimeout)
+	checkPositive(&errs, "max payload size", c.MaxPayloadSize)
 
-	if c.RetryBaseDelay <= 0 {
-		errs = append(errs, fmt.Errorf("retry base delay must be > 0, got %s", c.RetryBaseDelay))
-	}
-	if c.RetryMaxDelay <= 0 {
-		errs = append(errs, fmt.Errorf("retry max delay must be > 0, got %s", c.RetryMaxDelay))
-	}
-	if c.RetryBaseDelay > 0 && c.RetryMaxDelay > 0 && c.RetryMaxDelay < c.RetryBaseDelay {
-		errs = append(errs, fmt.Errorf("retry max delay (%s) must be >= retry base delay (%s)", c.RetryMaxDelay, c.RetryBaseDelay))
-	}
+	checkPositive(&errs, "retry base delay", c.RetryBaseDelay)
+	checkPositive(&errs, "retry max delay", c.RetryMaxDelay)
+	checkOrder(&errs, "retry base delay", "retry max delay", c.RetryBaseDelay, c.RetryMaxDelay)
 
-	if c.SucceededRetention <= 0 {
-		errs = append(errs, fmt.Errorf("succeeded retention must be > 0, got %s", c.SucceededRetention))
-	}
-	if c.DeadRetention <= 0 {
-		errs = append(errs, fmt.Errorf("dead retention must be > 0, got %s", c.DeadRetention))
-	}
-	if c.CleanupBatchSize <= 0 {
-		errs = append(errs, fmt.Errorf("cleanup batch size must be > 0, got %d", c.CleanupBatchSize))
-	}
+	checkPositive(&errs, "succeeded retention", c.SucceededRetention)
+	checkPositive(&errs, "dead retention", c.DeadRetention)
+	checkPositive(&errs, "cleanup batch size", c.CleanupBatchSize)
 	// 清理器与回收器共用同一套开关约定：0 是"未设置"，负值是关闭开关。
 	if c.CleanupInterval == 0 {
 		errs = append(errs, errors.New("cleanup interval must not be 0 (use a negative value to disable the cleanup)"))
@@ -339,15 +300,9 @@ type ClientConfig struct {
 // WithDefaults 返回一个副本，其中所有零值字段被替换为默认值。
 // 它不修改接收者，也不做合法性校验；校验请调用 Validate。
 func (c ClientConfig) WithDefaults() ClientConfig {
-	if c.DefaultQueue == "" {
-		c.DefaultQueue = DefaultQueue
-	}
-	if c.DefaultMaxAttempts == 0 {
-		c.DefaultMaxAttempts = DefaultMaxAttempts
-	}
-	if c.MaxPayloadSize == 0 {
-		c.MaxPayloadSize = DefaultMaxPayloadSize
-	}
+	c.DefaultQueue = defaultIfZero(c.DefaultQueue, DefaultQueue)
+	c.DefaultMaxAttempts = defaultIfZero(c.DefaultMaxAttempts, DefaultMaxAttempts)
+	c.MaxPayloadSize = defaultIfZero(c.MaxPayloadSize, DefaultMaxPayloadSize)
 	return c
 }
 
@@ -359,12 +314,8 @@ func (c ClientConfig) Validate() error {
 	if c.DefaultQueue == "" {
 		errs = append(errs, errors.New("client default queue is required"))
 	}
-	if c.DefaultMaxAttempts <= 0 {
-		errs = append(errs, fmt.Errorf("client default max attempts must be > 0, got %d", c.DefaultMaxAttempts))
-	}
-	if c.MaxPayloadSize <= 0 {
-		errs = append(errs, fmt.Errorf("client max payload size must be > 0, got %d", c.MaxPayloadSize))
-	}
+	checkPositive(&errs, "client default max attempts", c.DefaultMaxAttempts)
+	checkPositive(&errs, "client max payload size", c.MaxPayloadSize)
 
 	if len(errs) == 0 {
 		return nil
