@@ -6,7 +6,7 @@ GoRangeTask 是一个可嵌入 Go 服务的 **MySQL 持久化任务队列**，�
 >
 > **已可用**：任务与配置类型、Handler 注册表与 payload 解码、公开错误、MySQL migration（版本管理 + 脏状态检测）、完整的 MySQL Client（`Enqueue` / `EnqueueTx` / `Get` / `Cancel`，含幂等键），以及 Worker 侧的领取与执行闭环（`Claim` / `Succeed` / `Retry` / `MarkDead`、并发 `Run` 轮询、**租约续期与失租取消**、**过期租约回收**、**失败退避与永久错误分流**、**Handler panic 兜底**、**终态任务清理**、优雅停机、逐任务超时）。单元测试与真库集成测试覆盖上述实现，CI 已接入 MySQL。另有一个**可独立运行的示例服务** `example/basic`（业务行与任务行同事务创建、幂等 Handler、`cmd/demo` 入口），见下文「安装与快速开始」。**结构化日志**（`Config.Logger`）与**指标**（`Config.Metrics` / `ClientConfig.Metrics`）已接上，见下文「可观测性」；官方可选 **GORM adapter** 见下文「在 GORM 事务里入队」。
 >
-> **性能与恢复已实测（2026-10-17）**：数字、命令与原始 JSON 见[性能基线](docs/GoRangeTask-性能基线.md)。最要紧的几条——10,000 笔「业务行 + 任务行同一事务」中事务完整率 **100.00%**（回滚零残留、零孤儿任务）；Worker 停止续租后 **2.07 s** 任务被另一个 Worker 接手（租约 2 s 配置）；陈旧 epoch 的写回被 fencing 拒绝；256 B payload、单机 4 核（MySQL 与压测同机）下 W=1/4/16 为 **24–96 task/s**，每任务固定 6 条 SQL、InnoDB 行锁等待 ≈0。**这些数字只用来说明量级与瓶颈位置**：同一格两次运行能差 45%，且语义是"至少一次**尝试**"而非"保证业务处理成功"。
+> **性能与恢复已实测（2026-10-18，Ryzen 7 8745H；另有 2026-10-17 的 4 核机基线）**：数字、命令与原始 JSON 见[性能基线（Ryzen 7 8745H）](docs/GoRangeTask-性能基线-Ryzen7-8745H.md)。最要紧的几条——10,000 笔「业务行 + 任务行同一事务」中事务完整率 **100.00%**（回滚零残留、零孤儿任务）；Worker 停止续租后 **2.05–3.68 s** 任务被另一个 Worker 接手（租约 2 s 配置，上界 4.29 s）；陈旧 epoch 的写回被 fencing 拒绝；256 B payload、单机 8 核 16 线程（MySQL 与压测同机）下 W=1/4/16 为 **66–714 task/s**（W=32 到 1000），每任务固定 6 条 SQL、行锁等待接近 0。**这些数字只用来说明量级与瓶颈位置**：同一格两次运行最多差 13.6%（旧 4 核机上是 45%），且语义是"至少一次**尝试**"而非"保证业务处理成功"。
 >
 > **已知边界**：清理是**物理删除**。任务行被删掉之后它的幂等键就不再占用唯一索引，同一个键可以被重新接受——库保证的是"保留期内不重复入队"，不是"永不重复"。需要更强语义时要在业务侧自行去重。终态清理的保留期默认 7 天（`succeeded` / `canceled`）与 30 天（`dead`）；把 `CleanupInterval` 设成负值会关闭清理器，终态表将随任务吞吐单调增长。
 >
@@ -53,7 +53,7 @@ GoRangeTask 目标是让已提交任务在数据库和 Worker 可用、重试策
 - 官方可选 GORM adapter（`adapter/gorm`）。
 - 可独立运行的示例，演示事务入队、Worker 执行和故障恢复。
 
-性能与恢复已有实测基线（硬件、MySQL 参数、Worker 配置、命令与原始 JSON 齐全）：见[性能基线](docs/GoRangeTask-性能基线.md)。**不要把这些数字当成容量承诺**——它们来自一台与 MySQL 同机的笔记本，波动可达 45%，文档里也明确标出了"测不出来"的项。
+性能与恢复已有实测基线（硬件、MySQL 参数、Worker 配置、命令与原始 JSON 齐全）：见[性能基线（Ryzen 7 8745H）](docs/GoRangeTask-性能基线-Ryzen7-8745H.md)，以及[一台 4 核笔记本的旧基线](docs/GoRangeTask-性能基线.md)。**不要把这些数字当成容量承诺**——它们来自与 MySQL 同机的开发机（还有 14–32% 的背景负载，MySQL 跑在 WSL2 虚拟盘上），同一格两次运行最多差 13.6%，换机器后结论会变；文档里也明确标出了"测不出来"与"没测到"的项。
 
 ## 技术基线
 
@@ -438,9 +438,11 @@ err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 - [技术设计](docs/GoRangeTask-技术设计.md)：任务表 DDL、领取/续租/确认/回收 SQL、API 与验证计划；**附录 A** 是一次实测事故的完整留档——`SELECT ... FOR UPDATE LIMIT n` 的加锁范围由执行计划决定，计划一离开预期索引就会锁住整个积压、`SKIP LOCKED` 失效，附 `EXPLAIN`/`data_locks` 对照与固定手段。
 - [迁移机制](docs/GoRangeTask-迁移机制.md)：MySQL DDL、dirty 状态、advisory lock、多语句处理及实测验证。
 - [进度跟踪](docs/GoRangeTask-进度跟踪.md)：阶段状态、完成标准和可核验的实现证据。
-- [性能基线](docs/GoRangeTask-性能基线.md)：硬件/MySQL/Worker 配置、入队延迟、吞吐与伸缩、排队延迟、事务完整率、崩溃恢复耗时，以及**这些数字不能用来声称什么**。
+- [性能基线（Ryzen 7 8745H）](docs/GoRangeTask-性能基线-Ryzen7-8745H.md)：当前开发机上的硬件/MySQL/Worker 配置、入队延迟、吞吐与伸缩、排队延迟、事务完整率、崩溃恢复耗时，以及**这些数字不能用来声称什么**。
+- [性能基线（i5-8200Y，历史）](docs/GoRangeTask-性能基线.md)：同一套测法在一台 4 逻辑核笔记本上的结果，用于对照"哪些结论随机器变、哪些不变"。
 - [STAR 说明](docs/GoRangeTask-STAR.md)：项目定位、与手写 SQL 及 Outbox/RabbitMQ 的区别、简历证据框架（R 段为实测值）。
 - [下一步计划](docs/GoRangeTask-下一步计划.md)：还没做的事按"证据缺口 / 能力缺口 / 工程化"分优先级，每项都写清验收判据；同时列出**明确不做**的边界。
+- [面试复习指南](docs/GoRangeTask-面试复习指南.md)：按 19 个 Feat 拆解源码与设计取舍，用于面试前复盘。
 
 ## 许可
 
