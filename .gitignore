@@ -19,11 +19,12 @@ coverage.txt
 coverage.html
 *.prof
 
-# 编辑器与 IDE
+# 编辑器与 IDE / AI 助手
 .idea/
 .vscode/
 *.swp
 *.swo
+.workbuddy/
 
 # 环境变量与本地密钥
 .env
