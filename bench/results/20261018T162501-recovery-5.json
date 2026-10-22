@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "generated_at": "2026-10-18T16:28:45+08:00",
+    "go_version": "go1.27.1",
+    "num_cpu": 16,
+    "cpu_model": "AMD Ryzen 7 8745H with Radeon 780M Graphics",
+    "mem_total_kb": 16053108,
+    "load_avg_before": "n/a",
+    "load_avg_after": "n/a",
+    "cpu_util_before": "10.8%",
+    "cpu_util_after": "16.9%",
+    "mysql_version": "8.0.46",
+    "mysql_variables": {
+      "binlog_format": "ROW",
+      "innodb_buffer_pool_size": "134217728",
+      "innodb_flush_log_at_trx_commit": "1",
+      "innodb_flush_method": "fsync",
+      "max_connections": "151",
+      "sync_binlog": "1",
+      "transaction_isolation": "READ-COMMITTED"
+    },
+    "db_host": "127.0.0.1:3306",
+    "db_name": "gotask_bench",
+    "pool_settings": "MaxOpenConns=32 MaxIdleConns=32 ConnMaxLifetime=0（bench 固定值）",
+    "worker_config": {
+      "batch_size": "1",
+      "cleanup": "关闭（CleanupInterval=-1，避免删掉要统计的终态行）",
+      "concurrency": "见各场景（并发池大小；Run 按它起同等数量的领取 goroutine）",
+      "handler_timeout": "30s",
+      "heartbeat_interval": "10s",
+      "lease_duration": "30s",
+      "max_poll_interval": "2s",
+      "poll_interval": "250ms",
+      "queues": "bench",
+      "reaper": "关闭（ReapInterval=-1，隔离出干净的吞吐数字）",
+      "shutdown_timeout": "30s"
+    },
+    "notes": [
+      "压测进程与 MySQL 跑在同一台机器上，两者抢同一批 CPU 核：吞吐偏悲观，延迟偏乐观（进程内计时不含网络）。",
+      "没有网络跳数：客户端与数据库之间是 loopback，所以入队延迟只反映 SQL 与 fsync 的成本。",
+      "innodb_flush_log_at_trx_commit=1 且 sync_binlog=1 时，每次提交都要落盘，提交类延迟的下限由磁盘 fsync 决定。"
+    ]
+  },
+  "recovery": {
+    "lease_duration": "2s",
+    "heartbeat_interval": "666ms",
+    "reap_interval": "250ms",
+    "shutdown_timeout": "500ms",
+    "lease_remaining_at_stall_ms": 1993.578,
+    "recovery_seconds": 2.534,
+    "decomposition_ceiling_seconds": 4.294,
+    "first_worker_handler_runs": 1,
+    "second_worker_handler_runs": 1,
+    "final_status": "succeeded",
+    "final_attempt": 2,
+    "stale_write_back_rejected": true
+  }
+}

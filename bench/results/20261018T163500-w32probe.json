@@ -1,0 +1,174 @@
+{
+  "meta": {
+    "generated_at": "2026-10-18T16:30:01+08:00",
+    "go_version": "go1.27.1",
+    "num_cpu": 16,
+    "cpu_model": "AMD Ryzen 7 8745H with Radeon 780M Graphics",
+    "mem_total_kb": 16053108,
+    "load_avg_before": "n/a",
+    "load_avg_after": "n/a",
+    "cpu_util_before": "14.4%",
+    "cpu_util_after": "19.6%",
+    "mysql_version": "8.0.46",
+    "mysql_variables": {
+      "binlog_format": "ROW",
+      "innodb_buffer_pool_size": "134217728",
+      "innodb_flush_log_at_trx_commit": "1",
+      "innodb_flush_method": "fsync",
+      "max_connections": "151",
+      "sync_binlog": "1",
+      "transaction_isolation": "READ-COMMITTED"
+    },
+    "db_host": "127.0.0.1:3306",
+    "db_name": "gotask_bench",
+    "pool_settings": "MaxOpenConns=32 MaxIdleConns=32 ConnMaxLifetime=0（bench 固定值）",
+    "worker_config": {
+      "batch_size": "1",
+      "cleanup": "关闭（CleanupInterval=-1，避免删掉要统计的终态行）",
+      "concurrency": "见各场景（并发池大小；Run 按它起同等数量的领取 goroutine）",
+      "handler_timeout": "30s",
+      "heartbeat_interval": "10s",
+      "lease_duration": "30s",
+      "max_poll_interval": "2s",
+      "poll_interval": "250ms",
+      "queues": "bench",
+      "reaper": "关闭（ReapInterval=-1，隔离出干净的吞吐数字）",
+      "shutdown_timeout": "30s"
+    },
+    "notes": [
+      "压测进程与 MySQL 跑在同一台机器上，两者抢同一批 CPU 核：吞吐偏悲观，延迟偏乐观（进程内计时不含网络）。",
+      "没有网络跳数：客户端与数据库之间是 loopback，所以入队延迟只反映 SQL 与 fsync 的成本。",
+      "innodb_flush_log_at_trx_commit=1 且 sync_binlog=1 时，每次提交都要落盘，提交类延迟的下限由磁盘 fsync 决定。"
+    ]
+  },
+  "drain": [
+    {
+      "workers": 32,
+      "payload_bytes": 256,
+      "tasks": 2000,
+      "prefill_seconds": 3.3335713,
+      "drain_seconds": 2.0003325,
+      "throughput_per_s": 999.8337776344683,
+      "claim_latency": {
+        "n": 2032,
+        "p50_ms": 20.3,
+        "p95_ms": 26.19,
+        "p99_ms": 29.821,
+        "max_ms": 36.895,
+        "mean_ms": 20.478
+      },
+      "queue_wait": {
+        "n": 2000,
+        "p50_ms": 2613.417,
+        "p95_ms": 3293.838,
+        "p99_ms": 3340.671,
+        "max_ms": 3357.927,
+        "mean_ms": 2641.978
+      },
+      "processing": {
+        "n": 2000,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0.532,
+        "max_ms": 1.009,
+        "mean_ms": 0.01
+      },
+      "outcomes": {
+        "claimed": 2000,
+        "succeeded": 2000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 30
+      },
+      "db_delta": {
+        "questions": 12097,
+        "innodb_row_lock_waits": 1,
+        "innodb_row_lock_time_ms": 2
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 32,
+        "max_idle": 32,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 2,
+        "mean_percent_of_one_core": 183.27,
+        "max_percent_of_one_core": 365.83
+      },
+      "final_status_counts": {
+        "succeeded": 2000
+      }
+    },
+    {
+      "workers": 32,
+      "payload_bytes": 32768,
+      "tasks": 2000,
+      "prefill_seconds": 5.2821567,
+      "drain_seconds": 2.5602739,
+      "throughput_per_s": 781.1664212957841,
+      "claim_latency": {
+        "n": 2032,
+        "p50_ms": 25.668,
+        "p95_ms": 33.223,
+        "p99_ms": 37.284,
+        "max_ms": 42.351,
+        "mean_ms": 25.407
+      },
+      "queue_wait": {
+        "n": 2000,
+        "p50_ms": 3894.807,
+        "p95_ms": 5087.411,
+        "p99_ms": 5182.791,
+        "max_ms": 5300.631,
+        "mean_ms": 3890.668
+      },
+      "processing": {
+        "n": 2000,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0.533,
+        "max_ms": 0.78,
+        "mean_ms": 0.011
+      },
+      "outcomes": {
+        "claimed": 2000,
+        "succeeded": 2000,
+        "retried": 0,
+        "dead": 0,
+        "lease_lost": 0,
+        "handler_panicked": 0,
+        "handler_timed_out": 0,
+        "enqueued": 0,
+        "canceled": 0,
+        "max_concurrency": 30
+      },
+      "db_delta": {
+        "questions": 12097,
+        "innodb_row_lock_waits": 3,
+        "innodb_row_lock_time_ms": 2
+      },
+      "pool": {
+        "max_open_conns": 32,
+        "max_in_use": 32,
+        "max_idle": 32,
+        "wait_count": 0,
+        "wait_duration_ms": 0
+      },
+      "mysql_cpu": {
+        "samples": 2,
+        "mean_percent_of_one_core": 216.3,
+        "max_percent_of_one_core": 343.31
+      },
+      "final_status_counts": {
+        "succeeded": 2000
+      }
+    }
+  ]
+}

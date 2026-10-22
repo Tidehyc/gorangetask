@@ -235,13 +235,16 @@ func run(o options) error {
 // --- 环境 -------------------------------------------------------------------
 
 type meta struct {
-	GeneratedAt   string            `json:"generated_at"`
-	GoVersion     string            `json:"go_version"`
-	NumCPU        int               `json:"num_cpu"`
-	CPUModel      string            `json:"cpu_model"`
-	MemTotalKB    int64             `json:"mem_total_kb"`
-	LoadAvgBefore string            `json:"load_avg_before"`
-	LoadAvgAfter  string            `json:"load_avg_after,omitempty"`
+	GeneratedAt   string `json:"generated_at"`
+	GoVersion     string `json:"go_version"`
+	NumCPU        int    `json:"num_cpu"`
+	CPUModel      string `json:"cpu_model"`
+	MemTotalKB    int64  `json:"mem_total_kb"`
+	LoadAvgBefore string `json:"load_avg_before"`
+	LoadAvgAfter  string `json:"load_avg_after,omitempty"`
+	// CPU 利用率只在 Windows 上采集：那里没有 load average，用它说明"跑测时宿主有多忙"。
+	CPUUtilBefore string            `json:"cpu_util_before,omitempty"`
+	CPUUtilAfter  string            `json:"cpu_util_after,omitempty"`
 	MySQLVersion  string            `json:"mysql_version"`
 	MySQLVars     map[string]string `json:"mysql_variables"`
 	DBHost        string            `json:"db_host"`
@@ -255,9 +258,10 @@ func (m *meta) collect(ctx context.Context, db *sql.DB, dbName, dsn string) erro
 	m.GeneratedAt = time.Now().Format(time.RFC3339)
 	m.GoVersion = runtime.Version()
 	m.NumCPU = runtime.NumCPU()
-	m.CPUModel = firstLineValue("/proc/cpuinfo", "model name")
+	m.CPUModel = cpuModel()
 	m.MemTotalKB = memTotalKB()
-	m.LoadAvgBefore = loadAvg()
+	m.LoadAvgBefore = hostLoad()
+	m.CPUUtilBefore = cpuUtil()
 	m.DBName = dbName
 	m.DBHost = hostOf(dsn)
 	m.Pool = "MaxOpenConns=32 MaxIdleConns=32 ConnMaxLifetime=0（bench 固定值）"
@@ -302,7 +306,8 @@ func (m *meta) collect(ctx context.Context, db *sql.DB, dbName, dsn string) erro
 }
 
 func (m *meta) collectLoadAfter() error {
-	m.LoadAvgAfter = loadAvg()
+	m.LoadAvgAfter = hostLoad()
+	m.CPUUtilAfter = cpuUtil()
 	return nil
 }
 
@@ -310,7 +315,13 @@ func (m *meta) print() {
 	fmt.Printf("## 环境\n\n")
 	fmt.Printf("- 时间：%s\n", m.GeneratedAt)
 	fmt.Printf("- Go：%s，CPU：%s × %d\n", m.GoVersion, m.CPUModel, m.NumCPU)
-	fmt.Printf("- 内存：%d MiB；load average 开始/结束：%s / %s\n", m.MemTotalKB/1024, m.LoadAvgBefore, m.LoadAvgAfter)
+	fmt.Printf("- 内存：%d MiB\n", m.MemTotalKB/1024)
+	if m.CPUUtilBefore != "" {
+		fmt.Printf("- CPU 利用率（1 s 采样）开始/结束：%s / %s（Windows 无 load average，用利用率代替）\n",
+			m.CPUUtilBefore, m.CPUUtilAfter)
+	} else {
+		fmt.Printf("- load average 开始/结束：%s / %s\n", m.LoadAvgBefore, m.LoadAvgAfter)
+	}
 	fmt.Printf("- MySQL：%s @ %s，库 %s\n", m.MySQLVersion, m.DBHost, m.DBName)
 	vars := make([]string, 0, len(m.MySQLVars))
 	for k, v := range m.MySQLVars {
@@ -1050,50 +1061,6 @@ func splitDurations(s string) ([]time.Duration, error) {
 		out = append(out, d)
 	}
 	return out, nil
-}
-
-func firstLineValue(path, key string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "unknown"
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, key) {
-			if _, v, ok := strings.Cut(line, ":"); ok {
-				return strings.TrimSpace(v)
-			}
-		}
-	}
-	return "unknown"
-}
-
-func memTotalKB() int64 {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "MemTotal:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				n, _ := strconv.ParseInt(fields[1], 10, 64)
-				return n
-			}
-		}
-	}
-	return 0
-}
-
-func loadAvg() string {
-	data, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return "unknown"
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 3 {
-		return "unknown"
-	}
-	return strings.Join(fields[:3], " ")
 }
 
 // hostOf 只取出 host:port，用来在报告里说明数据库在哪；DSN 里的口令不进结果文件。

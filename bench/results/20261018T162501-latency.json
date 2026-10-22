@@ -1,0 +1,206 @@
+{
+  "meta": {
+    "generated_at": "2026-10-18T16:25:01+08:00",
+    "go_version": "go1.27.1",
+    "num_cpu": 16,
+    "cpu_model": "AMD Ryzen 7 8745H with Radeon 780M Graphics",
+    "mem_total_kb": 16053108,
+    "load_avg_before": "n/a",
+    "load_avg_after": "n/a",
+    "cpu_util_before": "39.4%",
+    "cpu_util_after": "15.9%",
+    "mysql_version": "8.0.46",
+    "mysql_variables": {
+      "binlog_format": "ROW",
+      "innodb_buffer_pool_size": "134217728",
+      "innodb_flush_log_at_trx_commit": "1",
+      "innodb_flush_method": "fsync",
+      "max_connections": "151",
+      "sync_binlog": "1",
+      "transaction_isolation": "READ-COMMITTED"
+    },
+    "db_host": "127.0.0.1:3306",
+    "db_name": "gotask_bench",
+    "pool_settings": "MaxOpenConns=32 MaxIdleConns=32 ConnMaxLifetime=0（bench 固定值）",
+    "worker_config": {
+      "batch_size": "1",
+      "cleanup": "关闭（CleanupInterval=-1，避免删掉要统计的终态行）",
+      "concurrency": "见各场景（并发池大小；Run 按它起同等数量的领取 goroutine）",
+      "handler_timeout": "30s",
+      "heartbeat_interval": "10s",
+      "lease_duration": "30s",
+      "max_poll_interval": "2s",
+      "poll_interval": "250ms",
+      "queues": "bench",
+      "reaper": "关闭（ReapInterval=-1，隔离出干净的吞吐数字）",
+      "shutdown_timeout": "30s"
+    },
+    "notes": [
+      "压测进程与 MySQL 跑在同一台机器上，两者抢同一批 CPU 核：吞吐偏悲观，延迟偏乐观（进程内计时不含网络）。",
+      "没有网络跳数：客户端与数据库之间是 loopback，所以入队延迟只反映 SQL 与 fsync 的成本。",
+      "innodb_flush_log_at_trx_commit=1 且 sync_binlog=1 时，每次提交都要落盘，提交类延迟的下限由磁盘 fsync 决定。"
+    ]
+  },
+  "latency": [
+    {
+      "workers": 1,
+      "arrival_interval": "100ms",
+      "window_seconds": 19.9042958,
+      "tasks": 200,
+      "elapsed_seconds": 20.1647118,
+      "throughput_per_s": 9.918316809268754,
+      "queue_wait": {
+        "n": 200,
+        "p50_ms": 103.579,
+        "p95_ms": 209.366,
+        "p99_ms": 237.937,
+        "max_ms": 252.853,
+        "mean_ms": 107.573
+      },
+      "processing": {
+        "n": 200,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "max_ms": 0.527,
+        "mean_ms": 0.002
+      },
+      "claim_latency": {
+        "n": 292,
+        "p50_ms": 9.589,
+        "p95_ms": 11.994,
+        "p99_ms": 14.171,
+        "max_ms": 14.634,
+        "mean_ms": 8.04
+      },
+      "db_delta": {
+        "questions": 1677,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "final_status_counts": {
+        "succeeded": 200
+      }
+    },
+    {
+      "workers": 4,
+      "arrival_interval": "100ms",
+      "window_seconds": 19.9060436,
+      "tasks": 200,
+      "elapsed_seconds": 19.9462765,
+      "throughput_per_s": 10.026934099705276,
+      "queue_wait": {
+        "n": 200,
+        "p50_ms": 56.83,
+        "p95_ms": 139.083,
+        "p99_ms": 195.582,
+        "max_ms": 250.203,
+        "mean_ms": 63.653
+      },
+      "processing": {
+        "n": 200,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "max_ms": 0.537,
+        "mean_ms": 0.005
+      },
+      "claim_latency": {
+        "n": 455,
+        "p50_ms": 3.78,
+        "p95_ms": 11.521,
+        "p99_ms": 13.066,
+        "max_ms": 14.665,
+        "mean_ms": 6.381
+      },
+      "db_delta": {
+        "questions": 2166,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "final_status_counts": {
+        "succeeded": 200
+      }
+    },
+    {
+      "workers": 1,
+      "arrival_interval": "500ms",
+      "window_seconds": 29.5058047,
+      "tasks": 60,
+      "elapsed_seconds": 29.5461158,
+      "throughput_per_s": 2.030723781296491,
+      "queue_wait": {
+        "n": 60,
+        "p50_ms": 214.885,
+        "p95_ms": 413.765,
+        "p99_ms": 949.168,
+        "max_ms": 949.168,
+        "mean_ms": 222.28
+      },
+      "processing": {
+        "n": 60,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "max_ms": 0,
+        "mean_ms": 0
+      },
+      "claim_latency": {
+        "n": 166,
+        "p50_ms": 3.726,
+        "p95_ms": 11.315,
+        "p99_ms": 12.504,
+        "max_ms": 13.52,
+        "mean_ms": 6.005
+      },
+      "db_delta": {
+        "questions": 739,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "final_status_counts": {
+        "succeeded": 60
+      }
+    },
+    {
+      "workers": 4,
+      "arrival_interval": "500ms",
+      "window_seconds": 29.5052782,
+      "tasks": 60,
+      "elapsed_seconds": 29.6654973,
+      "throughput_per_s": 2.0225516327346384,
+      "queue_wait": {
+        "n": 60,
+        "p50_ms": 137.289,
+        "p95_ms": 383.124,
+        "p99_ms": 411.008,
+        "max_ms": 411.008,
+        "mean_ms": 160.995
+      },
+      "processing": {
+        "n": 60,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0.534,
+        "max_ms": 0.534,
+        "mean_ms": 0.008
+      },
+      "claim_latency": {
+        "n": 250,
+        "p50_ms": 3.571,
+        "p95_ms": 11.373,
+        "p99_ms": 12.45,
+        "max_ms": 132.339,
+        "mean_ms": 5.611
+      },
+      "db_delta": {
+        "questions": 991,
+        "innodb_row_lock_waits": 0,
+        "innodb_row_lock_time_ms": 0
+      },
+      "final_status_counts": {
+        "succeeded": 60
+      }
+    }
+  ]
+}

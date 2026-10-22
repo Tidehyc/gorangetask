@@ -381,6 +381,11 @@ const (
 	recoveryHeartbeat = 666 * time.Millisecond
 	recoveryReap      = 250 * time.Millisecond
 	recoveryShutdown  = 500 * time.Millisecond
+	// 接手方 B 的轮询节奏。上界推导必须用 MaxPollInterval 而不是 PollInterval：
+	// B 在任务还是 running 的那 2 秒里会连续空轮询，退避一路涨到上限，
+	// 所以"租约到期后最晚多久被看到"由 2s 决定，不是 250ms。
+	recoveryPoll    = 250 * time.Millisecond
+	recoveryPollMax = 2 * time.Second
 )
 
 // runRecovery 测「Worker 停止续租 → 另一个 Worker 把任务接手跑完」的墙钟耗时。
@@ -392,8 +397,13 @@ const (
 // 因此这个数字是确定性可复现的；代价是 Handler 的 goroutine 还活着（它在测量结束时
 // 被放行，随即被 fencing 拒掉写回——这一条本身也是断言）。
 //
-// 恢复耗时按定义拆得开：剩余租约 + 一个回收周期 + 一次轮询 + 领取与执行。
+// 恢复耗时按定义拆得开：剩余租约 + 一个回收周期 + **最多一次退避到上限的轮询** + 领取与执行。
 // 报告里同时给出实测值与这个上界，两者差得远就说明有别的东西在拖时间。
+//
+// 这里的"一次轮询"是 MaxPollInterval 而不是 PollInterval：B 从启动到租约到期之间
+// 一直在空转，退避按 250ms → 500ms → 1s → 2s 往上爬，租约到期那一刻它很可能正睡在
+// 最长的那一档上。用 250ms 推上界会得到一个"实测值经常越界"的假上界——第一版就是
+// 这么写的，在快速机器上实测 3.63s 直接把它顶穿了。
 func runRecovery(ctx context.Context, db *sql.DB, client *mysqlstore.Client) (recoveryResult, error) {
 	if err := truncateAll(ctx, db); err != nil {
 		return recoveryResult{}, err
@@ -498,8 +508,8 @@ func runRecovery(ctx context.Context, db *sql.DB, client *mysqlstore.Client) (re
 	wB, err := gorangetask.NewWorker(client, regB, gorangetask.Config{
 		Queues:            []string{benchQueue},
 		Concurrency:       1,
-		PollInterval:      250 * time.Millisecond,
-		MaxPollInterval:   2 * time.Second,
+		PollInterval:      recoveryPoll,
+		MaxPollInterval:   recoveryPollMax,
 		BatchSize:         1,
 		LeaseDuration:     30 * time.Second,
 		HeartbeatInterval: 10 * time.Second,
@@ -525,8 +535,10 @@ func runRecovery(ctx context.Context, db *sql.DB, client *mysqlstore.Client) (re
 		return res, errors.New("第二个 Worker 未在 60s 内接手并完成（租约可能没有被回收）")
 	}
 	res.RecoverySeconds = round3(time.Since(stallAt).Seconds())
+	// 上界 = 剩余租约 + 一个回收周期 + 最多一次退避到上限的轮询 + 领取与执行。
+	// 0.05s 是领取事务与 Handler 自身的余量（实测 Handler 为 0.03ms 量级，留两个数量级的宽）。
 	res.DecompositionSeconds = round3(
-		res.LeaseRemainingAtStallMs/1000 + recoveryReap.Seconds() + 0.25 + 0.05)
+		res.LeaseRemainingAtStallMs/1000 + recoveryReap.Seconds() + recoveryPollMax.Seconds() + 0.05)
 
 	cancelB()
 	select {
